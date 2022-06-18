@@ -21,13 +21,14 @@ def centralize_np(pc, batch=False):
     return pc - pc.mean(axis=axis, keepdims=True)
 
 
-# scale/translation normalization
 def normalize(pc):
+    """Centralize and normalize to a unit ball. Take a batched pytorch tensor. """
     pc = centralize(pc)
     var = pc.pow(2).sum(dim=1, keepdim=True).sqrt()
     return pc / var.max(dim=2, keepdim=True)
 
 def normalize_np(pc, batch=False):
+    """Centralize and normalize to a unit ball. Take a numpy array. """
     pc = centralize_np(pc, batch)
     axis = 1 if batch else 0
     var = np.sqrt((pc**2).sum(axis=axis, keepdims=True))

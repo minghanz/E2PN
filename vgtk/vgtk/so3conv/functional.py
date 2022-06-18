@@ -32,7 +32,7 @@ def get_occupancy_features(pc, n_anchor, use_center=False):
     if has_normals:
         ns = pc[:,:,3:]
         if n_anchor > 1:
-            anchors = torch.from_numpy(get_anchors())
+            # anchors = torch.from_numpy(get_anchors())
             features_n = torch.einsum('bni,aij->bjna',ns.anchors)
         else:
             features_n = ns.transpose(1,2)[...,None].contiguous()
@@ -107,6 +107,8 @@ def initial_anchor_query(frag, centers, kernels, r, sigma):
 
 def inter_so3conv_blurring(xyz, feats, n_neighbor, radius, stride,
                            inter_idx=None, lazy_sample=True, radius_expansion=1.0):
+    """Sample a set of center points, and blur their feature with those of their neighboring points. 
+    Return the blurred feature and coordinate of the center points. """
     if inter_idx is None:
         _, inter_idx, sample_idx, sample_xyz = zpconv.inter_zpconv_grouping_ball(xyz, stride, radius * radius_expansion, n_neighbor, lazy_sample)
 
@@ -118,8 +120,8 @@ def inter_so3conv_blurring(xyz, feats, n_neighbor, radius, stride,
 def inter_so3conv_grouping(xyz, feats, stride, n_neighbor,
                           anchors, kernels, radius, sigma,
                           inter_idx=None, inter_w=None, lazy_sample=True,
-                          radius_expansion=1.0, pooling=None):
-    '''
+                          radius_expansion=1.0, pooling=None, norot=False):
+    '''Given input points and features, return the set of center points and features aggregated to the kernels centered at them. 
         xyz: [nb, 3, p1] coordinates
         feats: [nb, c_in, p1, na] features
         anchors: [na, 3, 3] rotation matrices
@@ -128,6 +130,8 @@ def inter_so3conv_grouping(xyz, feats, stride, n_neighbor,
         inter_w: [nb, p2, na, ks, nn] kernel weights:
                     Influences of each neighbor points on each kernel points
                     under the respective SO3 rotations
+        return:
+            new_feats: [nb, nc, nk, nb, na]
     '''
 
     if pooling is not None and stride > 1 and feats.shape[1] > 1:
@@ -137,7 +141,7 @@ def inter_so3conv_grouping(xyz, feats, stride, n_neighbor,
             pool_stride = stride
             # TODO: REMOVE HARD CODING
             stride_nn = int(n_neighbor * pool_stride**0.5)
-            stride = 1
+            stride = 1      # subsampling is taken care of by pool_stride, thus set stride to 1
         elif pooling == 'no-stride':
             pool_stride = 1
             stride_nn = n_neighbor
@@ -150,7 +154,10 @@ def inter_so3conv_grouping(xyz, feats, stride, n_neighbor,
     if inter_idx is None:
         grouped_xyz, inter_idx, sample_idx, new_xyz = zpconv.inter_zpconv_grouping_ball(xyz, stride,
                                                                          radius * radius_expansion, n_neighbor, lazy_sample)
-        inter_w = inter_so3conv_grouping_anchor(grouped_xyz, anchors, kernels, sigma)
+        if not norot:
+            inter_w = inter_so3conv_grouping_anchor(grouped_xyz, anchors, kernels, sigma)
+        else:
+            inter_w = inter_so3conv_grouping_anchor_norot(grouped_xyz, anchors, kernels, sigma)
 
 
         #####################DEBUGDEBUGDEBUGDEBUG####################################
@@ -177,16 +184,47 @@ def inter_so3conv_grouping(xyz, feats, stride, n_neighbor,
 
     return inter_idx, inter_w, new_xyz, new_feats, sample_idx
 
+def inter_so3conv_grouping_anchor_norot(grouped_xyz, anchors,
+                                  kernels, sigma, interpolate='linear'):
+    '''Calculate the weight between each kernel point and neighboring input point, at each location. 
+    The dimension of rotational anchors is not here because the kernel points are symmetric to the rotations. 
+        grouped_xyz: [b, 3, p2, nn]
+        kernels: [nk, 3]
+        sigma: float
+        (TODO: remove anchors: [na, 3, 3]
+        trace_idxv_ori: [12(na)*13(nk)])
+        return: [b, p2, nk, nn]
+    '''
+    # distance: b, p2, nk, nn (save the na dimension due to symmetry)
+    t_kernels = kernels.transpose(0,1)[None,:,None,:,None] # nk,3 -> 3,nk -> b,3,p2,nk,nn
+    t_gxyz = grouped_xyz[...,None,:] # b,3,p2,nn -> b,3,p2,nk,nn
+
+    if interpolate == 'linear':
+        dists = torch.sum((t_gxyz - t_kernels)**2, dim=1)    # b,p2,nk,nn
+        # dists = torch.sqrt(torch.sum((t_gxyz - t_rkernels)**2, dim=1))
+        inter_w = F.relu(1.0 - dists/sigma, inplace=True)
+    else:
+        raise NotImplementedError("kernel function %s is not implemented!"%interpolate)
+
+    # ### permute to augment b,p2,nk,nn to b,p2,na,nk,nn
+    # trace_idxv_ori = trace_idxv_ori[None,None,...,None] # na,nk -> b,p2,na,nk,nn
+    # inter_w = inter_w.unsqueeze(2).expand_as(trace_idxv_ori)  #  b,p2,nk,nn ->  b,p2,1,nk,nn -> b,p2,na,nk,nn
+    # inter_w = torch.gather(inter_w, 3, trace_idxv_ori)  # b,p2,na,nk,nn
+
+    return inter_w # b,p2,nk,nn
+
 def inter_so3conv_grouping_anchor(grouped_xyz, anchors,
                                   kernels, sigma, interpolate='linear'):
-    '''
+    '''Calculate the weight between each kernel point and neighboring input point, at each location under each rotation anchors.
         grouped_xyz: [b, 3, p2, nn]
-        ball_idx: [b, p2, nn]
         anchors: [na, 3, 3]
-        sample_idx: [b, p2]
+        kernels: [nk, 3]
+        sigma: float
+        return:  [b, p2, na, ks, nn]
     '''
 
     # kernel rotations:  3, na, ks
+    # [na,3,3] x [3,nk] -> [na,3,nk] -> [3,na,nk]
     rotated_kernels = torch.matmul(anchors, kernels.transpose(0,1)).permute(1,0,2).contiguous()
 
     # calculate influences: [3, na, ks] x [b, 3, p2, nn] -> [b, p2, na, ks, nn] weights
@@ -297,3 +335,69 @@ def get_intra_idx():
 
 def get_canonical_relative():
     return canonical_relative
+
+def get_relative_index():
+    return fr.get_relativeR_index(Rs)
+
+
+vs, v_adjs, v_level2s, v_opps, vRs = fr.icosahedron_trimesh_to_vertices(ANCHOR_PATH)    # 12*3, each vertex is of norm 1
+
+
+def get_anchorsV():
+    """return 60*3*3 matrix as rotation anchors determined by the symmetry of icosahedron vertices"""
+    return vRs.copy()
+
+def get_anchorsV12():
+    """return 12*3*3 matrix as the section (representative rotation) of icosahedron vertices. 
+    For each vertex on the sphere (icosahedron) (coset space S2 = SO(3)/SO(2)), 
+    pick one rotation as its representation in SO(3), which is also called a section function (G/H -> G)"""
+    return vRs.reshape(12, 5, 3, 3)[:,0].copy()    # 12*3*3
+
+def get_icosahedron_vertices():
+    return vs.copy(), v_adjs.copy(), v_level2s.copy(), v_opps.copy(), vRs.copy()
+
+def get_relativeV_index():
+    """return two 60(rotation anchors)*12(indices on s2) index matrices"""
+    trace_idx_ori, trace_idx_rot = fr.get_relativeV_index(vRs, vs)
+    return trace_idx_ori.copy(), trace_idx_rot.copy()
+
+def get_relativeV12_index():
+    """return two 12(rotation anchors)*12(indices on s2) index matrices"""
+    trace_idx_ori, trace_idx_rot = fr.get_relativeV_index(vRs, vs)  # 60(rotation anchors)*12(indices on s2), 60*12
+    trace_idx_ori = trace_idx_ori.reshape(12, 5, 12)[:,0]   # 12(rotation anchors)*12(indices on s2)
+    trace_idx_rot = trace_idx_rot.reshape(12, 5, 12)[:,0]   # 12(rotation anchors)*12(indices on s2)
+    return trace_idx_ori.copy(), trace_idx_rot.copy()
+
+def get_relativeVR_index(full=False):
+    """return two 60(rotation anchors)*60(indices on anchor rotations) index matrices,
+    or two 60(rotation anchors)*12(indices on the anchor rotations that are sections of icoshedron vertices) index matrices. 
+    The latter case is different from get_relativeV_index(), because here the indices are in the range of 60. 
+    """
+    trace_idx_ori, trace_idx_rot = fr.get_relativeR_index(vRs)  
+    # da     # find correspinding original element for each rotated (60,60)
+    # bd     # find corresponding rotated element for each original
+    trace_idx_rot = trace_idx_rot.transpose(0,1)    # db
+    if full:
+        return trace_idx_ori.copy(), trace_idx_rot.copy()
+
+    trace_idx_ori = trace_idx_ori.reshape(-1, 12, 5)    # d,12,5
+    trace_idx_rot = trace_idx_rot.reshape(-1, 12, 5)
+    trace_idx_ori = trace_idx_ori[..., 0]   # d,12
+    trace_idx_rot = trace_idx_rot[..., 0]   # d,12
+    return trace_idx_ori.copy(), trace_idx_rot.copy()
+
+# np.set_printoptions(threshold=np.inf)
+# trace_idx_ori, trace_idx_rot = get_relativeV_index()
+# print("trace_idxv_ori", trace_idx_ori, trace_idx_rot)
+
+# trace_idx_ori, trace_idx_rot = get_relative_index()
+# print("trace_idxr_ori_full", trace_idx_ori, trace_idx_rot)
+
+# trace_idx_ori, trace_idx_rot = get_relativeVR_index()
+# print("trace_idxr_ori", trace_idx_ori, trace_idx_rot)
+
+# print("vs", vs)
+# ### inspect that identity is included
+# print("vRs", vRs)
+# trace_idx_ori, trace_idx_rot = get_relativeVR_index(True)
+# print("trace_idxr_ori_full", trace_idx_ori, trace_idx_rot)

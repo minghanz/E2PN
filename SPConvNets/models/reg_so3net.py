@@ -30,7 +30,7 @@ class RegSO3ConvModel(nn.Module):
 
     def forward(self, x):
         # nb, 2, np, 3 -> [nb, 3, np] x [nb, 1, np, na]
-        x = torch.cat((x[:,0], x[:,1]),dim=0)
+        x = torch.cat((x[:,0], x[:,1]),dim=0)   # concat the two pcls to batch dimension
 
         x = M.preprocess_input(x, self.na_in, False)
         # x = M.preprocess_input(x, 1, False)
@@ -40,6 +40,8 @@ class RegSO3ConvModel(nn.Module):
 
         f1, f2 = torch.chunk(x.feats,2,dim=0)
         x1, x2 = torch.chunk(x.xyz,2,dim=0)
+        ### f1, x1: src; f2, x2: tgt
+        ### pc_src.T = R * pc_tgt.T
 
         # confidence, quats = self.outblock(x.feats)
         confidence, quats = self.outblock(f1, f2, x1, x2)
@@ -72,6 +74,7 @@ def build_model(opt,
     kpconv = opt.model.kpconv
     representation = opt.model.representation
     na = 1 if opt.model.kpconv else opt.model.kanchor
+    so3_pooling =  opt.model.flag
 
     if input_num > 1024:
         sampling_ratio /= (input_num / 1024)
@@ -136,7 +139,13 @@ def build_model(opt,
             # import ipdb; ipdb.set_trace()
 
             # one-inter one-intra policy
-            block_type = 'inter_block' if na != 60 else 'separable_block'
+            if na == 60:
+                block_type = 'separable_block' 
+            elif na == 12:
+                block_type = 'separable_s2_block'
+            else:
+                raise ValueError(f"na={na} not supported.")
+            # block_type = 'inter_block' if na != 60 else 'separable_block'
             conv_param = {
                 'type': block_type,
                 'args': {
@@ -168,6 +177,7 @@ def build_model(opt,
                 'kanchor': na,
                 'representation': representation,
                 'temperature': temperature,
+                'pooling': so3_pooling,
         }
 
     if to_file is not None:

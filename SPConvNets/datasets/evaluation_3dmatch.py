@@ -199,9 +199,9 @@ def evaluate_scene(scene_dir, feature_dir, scene_name, suffix=None, num_thread=8
     total_recall = np.mean(inlier_ratios > tau2)
     results = np.array(result_log)
 
-    print("Total recall is %0.2f" % (total_recall * 100))
+    print("\nTotal recall is %0.2f\n" % (total_recall * 100))
     np.savetxt(join(feature_dir, 'recall.txt'), results, fmt='%.2f', delimiter=',')
 
-    return [(tau, 100 * np.mean(inlier_ratios > tau)) for tau in TAU_RANGE]
+    return [(tau, 100 * np.mean(inlier_ratios > tau)) for tau in TAU_RANGE], total_recall
 
 

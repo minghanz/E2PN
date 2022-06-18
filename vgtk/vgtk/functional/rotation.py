@@ -112,6 +112,36 @@ def rand_rotation_matrix(deflection=1.0, randnums=None, makeT=False):
     else:
         return M
 
+def get_adjmatrix_trimesh_vtx(mesh, gsize=None):
+    """return: nparray of size (12,5) (12,5) (12,)"""
+    vertices = mesh.vertices    # 12,3
+    vtx_adj = mesh.edges    # 60*2 (each edge has the reverse pair as well)
+    v_neighbors = mesh.vertex_neighbors # 12,5 ndarray
+
+    level_2s = []
+    opposites = []
+    for i in range(vertices.shape[0]):
+        counted = []
+        counted.append(i)
+        vns = v_neighbors[i]
+        counted.extend(vns)
+        level_2 = []
+        for vn in vns:
+            vnns = v_neighbors[vn]
+            for vnn in vnns:
+                if vnn not in counted:
+                    level_2.append(vnn)
+                    counted.append(vnn)
+        level_2s.append(level_2)
+        for j in range(vertices.shape[0]):
+            if j not in counted:
+                opposites.append(j)
+                break
+    
+    level_2s = np.array(level_2s)   # 12,5
+    opposites = np.array(opposites) # 12
+            
+    return v_neighbors, level_2s, opposites
 
 # functions for so3 sampling
 def get_adjmatrix_trimesh(mesh, gsize=None):
@@ -137,6 +167,128 @@ def get_adjmatrix_trimesh(mesh, gsize=None):
         rp = rp + np.arange(gsize)[None].repeat(na*gsize,axis=0)
         R_adj = np.concatenate([R_adj, rp], axis=1)
         return R_adj
+
+def get_so3_from_anchors_np_zyz(face_normals, gsize=3):
+    # alpha, beta
+    na = face_normals.shape[0]
+    cbeta = face_normals[...,-1]
+    sbeta = (1 - cbeta**2)**0.5
+    calpha = face_normals[...,0] / sbeta
+    salpha = face_normals[...,1] / sbeta
+
+    if gsize==5:
+        calpha = np.where(np.isnan(calpha) & (cbeta>0), np.ones_like(calpha), calpha)
+        calpha = np.where(np.isnan(calpha) & (cbeta<0), -np.ones_like(calpha), calpha)
+        salpha = np.where(np.isnan(salpha), np.zeros_like(salpha), salpha)
+
+    # gamma
+    gamma = np.linspace(0, 2 * np.pi, gsize, endpoint=False, dtype=np.float32)
+    gamma = gamma[None].repeat(na, axis=0)
+
+    # Compute na rotation matrices Rx, Ry, Rz
+    Rz = np.zeros([na, 9], dtype=np.float32)
+    Ry = np.zeros([na, 9], dtype=np.float32)
+    Rx = np.zeros([na, gsize, 9], dtype=np.float32)
+    Rx2 = np.zeros([na, gsize, 9], dtype=np.float32)
+    # Rx3 = np.zeros([na, gsize, 9], dtype=np.float32)
+    # Rx4 = np.zeros([na, gsize, 9], dtype=np.float32)
+
+    # see xyz convention in http://mathworld.wolfram.com/EulerAngles.html
+    # D matrix
+    Rz[:,0] = calpha
+    Rz[:,1] = -salpha
+    Rz[:,2] = 0
+    Rz[:,3] = salpha
+    Rz[:,4] = calpha
+    Rz[:,5] = 0
+    Rz[:,6] = 0
+    Rz[:,7] = 0
+    Rz[:,8] = 1
+
+    # C matrix
+    Ry[:,0] = cbeta
+    Ry[:,1] = 0
+    Ry[:,2] = sbeta
+    Ry[:,3] = 0
+    Ry[:,4] = 1
+    Ry[:,5] = 0
+    Ry[:,6] = -sbeta
+    Ry[:,7] = 0
+    Ry[:,8] = cbeta
+
+    # B Matrix
+    Rx[:,:,0] = np.cos(gamma)
+    Rx[:,:,1] = -np.sin(gamma)
+    Rx[:,:,2] = 0
+    Rx[:,:,3] = np.sin(gamma)
+    Rx[:,:,4] = np.cos(gamma)
+    Rx[:,:,5] = 0
+    Rx[:,:,6] = 0
+    Rx[:,:,7] = 0
+    Rx[:,:,8] = 1
+
+    # padding = 60  # hardcoded for gsize=3
+    padding = 2 * np.pi / gsize / 2 # adaptive to gsize
+    Rx2[:,:,0] = np.cos(gamma+padding) #/180*np.pi
+    Rx2[:,:,1] = -np.sin(gamma+padding) #/180*np.pi
+    Rx2[:,:,2] = 0
+    Rx2[:,:,3] = np.sin(gamma+padding) #/180*np.pi
+    Rx2[:,:,4] = np.cos(gamma+padding) #/180*np.pi
+    Rx2[:,:,5] = 0
+    Rx2[:,:,6] = 0
+    Rx2[:,:,7] = 0
+    Rx2[:,:,8] = 1
+
+    # Rx3[:,:,0] = np.cos(gamma+2*padding) #/180*np.pi
+    # Rx3[:,:,1] = -np.sin(gamma+2*padding) #/180*np.pi
+    # Rx3[:,:,2] = 0
+    # Rx3[:,:,3] = np.sin(gamma+2*padding) #/180*np.pi
+    # Rx3[:,:,4] = np.cos(gamma+2*padding) #/180*np.pi
+    # Rx3[:,:,5] = 0
+    # Rx3[:,:,6] = 0
+    # Rx3[:,:,7] = 0
+    # Rx3[:,:,8] = 1
+
+    # Rx4[:,:,0] = np.cos(gamma+3*padding) #/180*np.pi
+    # Rx4[:,:,1] = -np.sin(gamma+3*padding) #/180*np.pi
+    # Rx4[:,:,2] = 0
+    # Rx4[:,:,3] = np.sin(gamma+3*padding) #/180*np.pi
+    # Rx4[:,:,4] = np.cos(gamma+3*padding) #/180*np.pi
+    # Rx4[:,:,5] = 0
+    # Rx4[:,:,6] = 0
+    # Rx4[:,:,7] = 0
+    # Rx4[:,:,8] = 1
+
+    Rz = Rz[:,None].repeat(gsize,axis=1).reshape(na*gsize, 3,3)
+    Ry = Ry[:,None].repeat(gsize,axis=1).reshape(na*gsize, 3,3)
+    Rx = Rx.reshape(na*gsize,3,3)
+    Rx2 = Rx2.reshape(na*gsize,3,3)
+    # Rx3 = Rx3.reshape(na*gsize,3,3)
+    # Rx4 = Rx4.reshape(na*gsize,3,3)
+
+    Ryx = np.einsum('bij,bjh->bih', Ry, Rx)
+    Ryx2 = np.einsum('bij,bjh->bih', Ry, Rx2)
+    # Ryx3 = np.einsum('bij,bjh->bih', Ry, Rx3)
+    # Ryx4 = np.einsum('bij,bjh->bih', Ry, Rx4)
+    Rs1 = np.einsum('bij,bjh->bih', Rz, Ryx)
+    Rs2 = np.einsum('bij,bjh->bih', Rz, Ryx2)
+    # Rs3 = np.einsum('bij,bjh->bih', Rz, Ryx3)
+    # Rs4 = np.einsum('bij,bjh->bih', Rz, Ryx4)
+
+    z_val = (face_normals[:, -1])[:, None].repeat(gsize, axis=1).reshape(na*gsize, 1, 1)
+    # import ipdb; ipdb.set_trace()
+    if gsize == 3:
+        Rs = Rs1*(np.abs(z_val+0.79)<0.01)+Rs2*(np.abs(z_val+0.19)<0.01)+\
+            Rs1*(np.abs(z_val-0.19)<0.01)+Rs2*(np.abs(z_val-0.79)<0.01)
+        # -0.7947, -0.1876, 0.1876, 0.7967
+        # each will make only one of the four conditions true
+    elif gsize == 5:
+        Rs = Rs2*(np.abs(z_val+1)<0.01)+Rs1*(np.abs(z_val+0.447)<0.01)+\
+            Rs2*(np.abs(z_val-0.447)<0.01)+Rs1*(np.abs(z_val-1)<0.01)
+        # Rs = Rs1
+    else:
+        raise NotImplementedError('gsizee other than 3 (for faces) or 5 (for vertices) are not supported: %d'%gsize)
+    return Rs
 
 def get_so3_from_anchors_np(face_normals, gsize=3):
     # alpha, beta
@@ -233,6 +385,42 @@ def get_so3_from_anchors_np(face_normals, gsize=3):
 
 #     return Rs
 
+def icosahedron_trimesh_to_vertices(mesh_path):
+    mesh = trimesh.load(mesh_path)  # trimesh 3.9 does not work. need 3.2
+    mesh.fix_normals()
+    vs = mesh.vertices  # each vertex is of norm 1
+
+    # the 5 rotation matrices for each of the 12 vertices
+    Rs = get_so3_from_anchors_np_zyz(vs, gsize=5)
+    # Rs = Rs.reshape(vs.shape[0], 5, 3, 3)
+    # the index of the opposite vertex and the two five-vertex-ring for each vertex
+    v_adjs, v_level2s, v_opps = get_adjmatrix_trimesh_vtx(mesh) # 12*5, 12*5, 12
+    return vs, v_adjs, v_level2s, v_opps, Rs
+
+def get_relativeV_index(Rs, vs):
+    # the permutation of the 12 vertices under the 60 rotations
+    # Rs: 60*3*3, vs: 12*3
+    print("Rs.shape", Rs.shape, vs.shape)
+    incr_r = np.einsum('dij,aj->dai', Rs, vs) # drotation*anchor, 60*12*3
+    incr_r = incr_r[:,:,None]   # 60*12*1*3
+    ori_vs = vs[None,None]      # 1*1*12*3
+
+    diff_r = incr_r - ori_vs  # 60*12(rot)*12(ori)*3
+    trace = (diff_r**2).sum(-1)  # 60*12*12
+    trace_idx_ori = np.argmin(trace,axis=2) # find correspinding original element for each rotated
+    trace_idx_rot = np.argmin(trace,axis=1) # find corresponding rotated element for each original
+
+    return trace_idx_ori, trace_idx_rot
+
+def get_adjmatrix_trimesh_cycle(Rs, vs, v_neighbors, level_2s, opposites):
+    # 60*3*3, vs: 12*3, v_neighbors: 12*5, level_2s: 12*5, opposites: 12
+    Rs = Rs.reshape(12,5,3,3)
+    vs0_r = np.matmul(Rs[0,0], vs[0].reshape(3,1))
+    assert np.allclose(vs0_r.reshape(3,), vs[0]), f"{vs0_r.reshape(3,)}, {vs[0]}"
+    trace_idx_ori, trace_idx_rot = get_relativeV_index(Rs, vs)
+    for i in range(12):
+        vn0 = v_neighbors[i,0]
+        
 def icosahedron_so3_trimesh(mesh_path, gsize=3, use_quats=False):
     # 20 faces, 12 vertices
     # root = vgtk.__path__[0]
@@ -343,6 +531,38 @@ def icosahedron_so3_trimesh(mesh_path, gsize=3, use_quats=False):
     return Rs, trace_idx, canonical_R
     # return Rs, trace_idx, canonical_R
 
+def get_relativeR_index(Rs):
+    incr_r = np.einsum('dij,ajk->daik', Rs, Rs) # drotation*anchor
+    diff_r = np.einsum('bij,daik->bdajk', Rs, incr_r)
+    trace = 0.5 * (np.einsum('bdaii->bda', diff_r) - 1)
+    trace_idx_ori = np.argmax(trace,axis=0) # bda -> da     # find correspinding original element for each rotated
+    trace_idx_rot = np.argmax(trace,axis=2) # bda -> bd     # find corresponding rotated element for each original
+
+    # ### check closure property
+    # trace_max0 = np.amax(trace, 0)
+    # trace_max2 = np.amax(trace, 2)
+    # assert np.allclose(trace_max0, 1), trace_max0
+    # assert np.allclose(trace_max2, 1), trace_max2
+    # ### check inverse property (inverse of an element is also in the set)
+    # diff_r_test = np.einsum('dij,ajk->daik', Rs, Rs)
+    # diff_r_trace = 0.5 * (np.einsum('daii->da', diff_r_test) - 1)
+    # trace_max0 = np.amax(diff_r_trace, 0)
+    # trace_max2 = np.amax(diff_r_trace, 1)
+    # assert np.allclose(trace_max0, 1), trace_max0
+    # assert np.allclose(trace_max2, 1), trace_max2
+
+    return trace_idx_ori, trace_idx_rot
+
+def test_relativeR_index(trace_idx_ori, trace_idx_rot, Rs):
+    for i in range(60):
+        for j in range(60):
+            # Rs[i] @ Rs[j] == Rs[trace_idx_ori[i,j]]
+            diff_r_cos = 0.5 * (np.trace(Rs[i] @ Rs[j] @ Rs[trace_idx_ori[i,j]].swapaxes(0,1)) - 1)
+            assert np.isclose(diff_r_cos, 1, rel_tol=1e-5, abs_tol=1e-5), f"trace_idx_ori {i} {j} {diff_r_cos}"
+            # Rs[i] == Rs[j] @ Rs[trace_idx_rot[i,j]]
+            diff_r_cos = 0.5 * (np.trace(Rs[j] @ Rs[trace_idx_rot[i,j]] @ Rs[i].swapaxes(0,1)) - 1)
+            assert np.isclose(diff_r_cos, 1, rel_tol=1e-5, abs_tol=1e-5), f"trace_idx_rot {i} {j} {diff_r_cos}"
+    return
 
 '''
     (B)x3x3, Nx3x3 -> dist, idx
@@ -519,8 +739,25 @@ def so3_mean(Rs, weights=None):
 
 
 def label_relative_rotation_np(anchors, T):
+    """For all anchor rotations, it finds their corresponding anchor rotation such that the difference between two rotations is closest to the queried rotation.
+    They are used as the rotation classification label. 
+    return: 
+    R_target: [60,3,3]
+    label: [60]"""
     T_from_anchors = np.einsum('abc,bj,ijk -> aick', anchors, T, anchors)
+    # R_res = Ra^T R Ra (Ra R_res = R Ra)
     label = np.argmax(np.einsum('abii->ab', T_from_anchors),axis=1)
     idxs = np.vstack([np.arange(label.shape[0]), label]).T
     R_target = T_from_anchors[idxs[:,0], idxs[:,1]]
+    return R_target, label
+
+def label_relative_rotation_simple(anchors, T):
+    """Find the anchor rotation that is closest to the queried rotation. 
+    return: 
+    R_target: [3,3], T = R_target * anchors[label]
+    label: int"""
+    T_then_anchors = np.einsum('ij,akj->aik', T, anchors)
+    label = np.argmax(np.einsum('aii->a', T_then_anchors),axis=0)
+    R_target = T_then_anchors[label.item()]
+    # return: [3,3], int
     return R_target, label

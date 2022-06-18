@@ -17,10 +17,12 @@ import vgtk.so3conv as sgtk
 # ------------------------------------- loss ------------------------------------
 class CrossEntropyLoss(torch.nn.Module):
     def __init__(self):
+        """For multi-class classification. """
         super(CrossEntropyLoss, self).__init__()
         self.metric = torch.nn.CrossEntropyLoss()
 
     def forward(self, pred, label):
+        """The classification dim of pred is always at dim 1. label.shape == pred.shape[[0,2:]]. """
         _, pred_label = pred.max(1)
 
         pred_label = pred_label.reshape(-1)
@@ -31,6 +33,7 @@ class CrossEntropyLoss(torch.nn.Module):
 
 class AttentionCrossEntropyLoss(torch.nn.Module):
     def __init__(self, loss_type, loss_margin):
+        """CrossEntropyLoss on category and rotation. """
         super(AttentionCrossEntropyLoss, self).__init__()
         self.metric = CrossEntropyLoss()
         self.loss_type = loss_type
@@ -38,21 +41,16 @@ class AttentionCrossEntropyLoss(torch.nn.Module):
         self.iter_counter = 0
 
     def forward(self, pred, label, wts, rlabel, pretrain_step=2000):
+        """
+        pred: unnormalized scores for category classification
+        label: category label
+        wts: (BxA) rotation class prediction
+        rlabel: (B) rotation class label
+        """
+        ### category classification loss
         cls_loss, acc = self.metric(pred, label)
 
-        '''
-        rlabel: B or Bx60 -> BxC
-        wts: BxA or BxCxA -> BxAxC
-        '''
-
-        if wts.ndimension() == 3:
-            if wts.shape[1] <= rlabel.shape[1]:
-                # BxC
-                rlabel = rlabel[:, :wts.shape[1]]
-            else:
-                rlabel = rlabel.repeat(1,10)[:, :wts.shape[1]]
-            # BxAxC
-            wts = wts.transpose(1,2)
+        ### rotation classification loss
 
         r_loss, racc = self.metric(wts, rlabel)
 
@@ -72,7 +70,60 @@ class AttentionCrossEntropyLoss(torch.nn.Module):
         if self.training:
             self.iter_counter += 1
 
+        ### total loss, cross entropy loss on categories, cross entropy loss on rotations, 
+        ### accuracy of categories classification, accuracy of rotation classification
         return loss, cls_loss, r_loss, acc, racc
+
+class AttPermuteCrossEntropyLoss(torch.nn.Module):
+    def __init__(self, loss_type, loss_margin, device):
+        """CrossEntropyLoss on category and BCEWithLogitsLoss on anchors. """
+        super(AttPermuteCrossEntropyLoss, self).__init__()
+        self.metric = CrossEntropyLoss()
+        self.loss_type = loss_type
+        self.loss_margin = loss_margin
+        self.iter_counter = 0
+        self.bn_classifier = nn.BCEWithLogitsLoss(pos_weight=torch.ones([1], device=device)*12) # pos_weight has to be a tensor on the correct device
+
+    def forward(self, pred, label, wts, rlabel, pretrain_step=2000, anchor_label=None):
+        """
+        pred: (BC) unnormalized scores for category classification
+        label: (B) category label
+        wts: (BRA, R for rotations, A for anchors) anchor alignment prediction
+        rlabel: (B) rotation class label
+        anchor_label: (BRA) anchor alignment label
+        """
+        ### category classification loss
+        cls_loss, acc = self.metric(pred, label)
+        
+        ### rotation classification loss
+        # binary loss on the anchors
+        r_loss = self.bn_classifier(wts.reshape(-1), anchor_label.reshape(-1) )   #[-1], [-1], labels also need to be float
+
+        # cross entropy loss on the rotations
+        confidence = torch.sigmoid(wts)
+        confidence_r = confidence.sum(-1)   # b, r
+        cls_loss_r, racc = self.metric(confidence_r, rlabel)    # [b,r], [b], labels does not have the class dimension, therefore of ndim one less than prediction
+
+        m = self.loss_margin
+        loss_type = self.loss_type
+
+        if loss_type == 'schedule':
+            cls_loss_wts = min(float(self.iter_counter) / pretrain_step, 1.0)
+            loss = cls_loss_wts * cls_loss + (m + 1.0 - cls_loss_wts) * r_loss
+        elif loss_type == 'default':
+            loss = cls_loss + m * r_loss
+        elif loss_type == 'no_reg':
+            loss = cls_loss
+        else:
+            raise NotImplementedError(f"{loss_type} is not Implemented!")
+
+        if self.training:
+            self.iter_counter += 1
+
+        ### total loss, cross entropy loss on categories, binary classification loss on anchors, 
+        ### accuracy of categories classification, accuracy of rotation classification
+        return loss, cls_loss, r_loss, acc, racc
+
 
 def batched_select_anchor(labels, y, rotation_mapping):
     '''
@@ -92,7 +143,8 @@ def batched_select_anchor(labels, y, rotation_mapping):
     return pred_RAnchor
 
 class MultiTaskDetectionLoss(torch.nn.Module):
-    def __init__(self, anchors, nr=4, w=10, threshold=1.0, ):
+    def __init__(self, anchors, nr=4, w=10, threshold=1.0, s2_mode=False, r_cls_loss=False):
+        """Classification and regression loss on rotations. """
         super(MultiTaskDetectionLoss, self).__init__()
         self.classifier = CrossEntropyLoss()
         self.anchors = anchors
@@ -102,7 +154,60 @@ class MultiTaskDetectionLoss(torch.nn.Module):
         self.threshold = threshold
         self.iter_counter = 0
 
-    def forward(self, wts, label, y, gt_R, gt_T=None):
+        self.s2_mode = s2_mode
+        self.r_cls_loss = r_cls_loss
+        self.bn_classifier = nn.BCEWithLogitsLoss(pos_weight=torch.ones([1], device=anchors.device)*12) # pos_weight has to be a tensor on the correct device
+
+    def forward_simple(self, wts, label, y, gt_R, gt_T, anchor_label):
+        ''' setting for alignment regression:
+                - label (nb,) or (nb,1)?:
+                    label the targte anchor from the perspective of source anchor na
+                - wts (nb, n_rotations, na) normalized confidence weights
+                - y (nb, d_rotation) features
+                - gt_R (nb, 3, 3)
+                    relative rotation to regress from the perspective of source anchor na
+                    gt_T = gt_R @ anchors[label]
+                - gt_T (nb, 3, 3)
+                    ground truth relative rotation: gt_T @ R_tgt = R_src
+                - anchor_label (nb, n_rotations, na)
+                    ground truth relative rotation: gt_T @ R_tgt = R_src
+        '''
+        b = wts.shape[0]
+        nr = self.nr # 4 or 6
+        na = wts.shape[1]
+        rotation_mapping = compute_rotation_matrix_from_quaternion if nr == 4 else compute_rotation_matrix_from_ortho6d
+
+        true_R = gt_T
+
+        label = label.reshape(-1)
+        ### rotation classification loss
+        cls_loss = self.bn_classifier(wts.reshape(-1), anchor_label.reshape(-1) )   #[-1], [-1], labels also need to be float
+
+        confidence = torch.sigmoid(wts)
+        confidence_r = confidence.sum(-1)   # b, r
+        cls_loss_r, r_acc = self.classifier(confidence_r, label)    # [b,r], [b], labels does not have the class dimension, therefore of ndim one less than prediction
+        if self.r_cls_loss:
+            cls_loss = cls_loss + cls_loss_r
+
+        _, max_r = torch.max(confidence_r, 1)  # b
+        anchor_pred = self.anchors[max_r]
+        R_pred = rotation_mapping(y).view(b,3,3).contiguous()
+        pred_R = torch.matmul(R_pred, anchor_pred)
+
+        gt_R_for_anchor_pred = torch.einsum("bij,bkj->bik", gt_T, anchor_pred)
+        
+        # option 1: l2 loss for the prediction at each "tight" anchor pair
+        l2_loss = torch.pow(gt_R_for_anchor_pred - R_pred,2).mean()
+        loss = cls_loss + self.w * l2_loss
+
+        if self.training:
+            self.iter_counter += 1
+
+        ### total loss, binary classification loss on anchors, l2 loss on residual rotation matrix, 
+        ### accuracy of rotation classification, angular error of rotation prediction
+        return loss, cls_loss, self.w * l2_loss, r_acc, mean_angular_error(pred_R, true_R)
+
+    def forward(self, wts, label, y, gt_R, gt_T=None, anchor_label=None):
         ''' setting for alignment regression:
                 - label (nb, na):
                     label the targte anchor from the perspective of source anchor na
@@ -110,7 +215,8 @@ class MultiTaskDetectionLoss(torch.nn.Module):
                 - y (nb, nr, na_tgt, na_src) features
                 - gt_R (nb, na, 3, 3)
                     relative rotation to regress from the perspective of source anchor na
-                    Ra_tgti @ gt_R_i @ Ra_srci.T = gt_T for each i
+                    Ra_tgti @ gt_R_i @ Ra_srci.T = gt_T for each i (Minghan: wrong,
+                    should be Ra_srci @ gt_R_i @ Ra_tgti.T = gt_T for each i, see line with einsum)
                 - gt_T (nb, 3, 3)
                     ground truth relative rotation: gt_T @ R_tgt = R_src
 
@@ -120,6 +226,9 @@ class MultiTaskDetectionLoss(torch.nn.Module):
                 - y (nb, nr, na) features to be mapped to 3x3 rotation matrices
                 - gt_R (nb, na, 3, 3) relative rotation between gtR and each anchor
         '''
+
+        if self.s2_mode:
+            return self.forward_simple(wts, label, y, gt_R, gt_T, anchor_label)
 
         b = wts.shape[0]
         nr = self.nr # 4 or 6
@@ -207,6 +316,8 @@ class MultiTaskDetectionLoss(torch.nn.Module):
         if self.training:
             self.iter_counter += 1
 
+        ### total loss, cross entropy loss on rotations, l2 loss on residual rotation matrix, 
+        ### accuracy of rotation classification, angular error of rotation prediction
         return loss, cls_loss, self.w * l2_loss, r_acc, mean_angular_error(pred_R, true_R)
 
 def angle_from_R(R):
@@ -237,8 +348,10 @@ def batch_hard_negative_mining(dist_mat):
 
 
 class TripletBatchLoss(nn.Module):
-    def __init__(self, opt, anchors, sigma=2e-1, \
-                 interpolation='spherical', alpha=0.0):
+    def __init__(self, opt, anchors=None, sigma=2e-1, \
+                 interpolation='spherical', alpha=0.0,
+                 beta=0.0,
+                 ):
         '''
             anchors: na x 3 x 3, default anchor rotations
             margin: float, for triplet loss margin value
@@ -247,6 +360,21 @@ class TripletBatchLoss(nn.Module):
             interpolation: str "spherical" | "linear"
         '''
         super(TripletBatchLoss, self).__init__()
+        
+        if anchors is None:
+            if opt.model.kanchor == 12:
+                anchors = sgtk.get_anchorsV()
+                trace_idx_ori, trace_idx_rot = sgtk.get_relativeVR_index(full=True)
+                self.register_buffer("trace_idx_ori", torch.tensor(trace_idx_ori, dtype=torch.long).to(device=opt.device))# 60*60 da
+                self.register_buffer("trace_idx_rot", torch.tensor(trace_idx_rot, dtype=torch.long).to(device=opt.device))# 60*60 db
+                # self.trace_idx_ori = torch.nn.Parameter(torch.tensor(trace_idx_ori, dtype=torch.long),
+                #                 requires_grad=False)   # 60*60 da
+                # self.trace_idx_rot = torch.nn.Parameter(torch.tensor(trace_idx_rot, dtype=torch.long),
+                #                 requires_grad=False)   # 60*60 db
+                self.crossentropyloss = CrossEntropyLoss()
+            else:
+                anchors = sgtk.get_anchors(opt.model.kanchor)
+            anchors = torch.tensor(anchors).to(device=opt.device)
 
         # anchors = sgtk.functinoal.get_anchors()
         self.register_buffer('anchors', anchors)
@@ -255,6 +383,7 @@ class TripletBatchLoss(nn.Module):
         self.loss = opt.train_loss.loss_type
         self.margin = opt.train_loss.margin
         self.alpha = alpha
+        self.beta = beta    # for permute loss
         self.sigma = sigma
         self.interpolation = interpolation
         self.k_precision = 1
@@ -274,8 +403,48 @@ class TripletBatchLoss(nn.Module):
             # assert hasattr(self, 'attention_params')
             # return self._forward_attention(src, tgt, T, attention_feats)
             return self._forward_equivariance(src, tgt, equi_src, equi_tgt, T)
+        elif self.beta > 0 and equi_src is not None and equi_tgt is not None:
+            return self._forward_att_permute(src, tgt, equi_src, equi_tgt, T)
         else:
             return self._forward_invariance(src, tgt)
+
+    def _forward_att_permute(self, src, tgt, equi_src, equi_tgt, T_label):
+        """equi_src, equi_tgt: br; T_label: 1"""
+        
+        inv_loss, acc, fp, cn = self._forward_invariance(src, tgt)
+        inv_info = [inv_loss, acc, fp, cn]
+
+        if T_label.numel() == 1:
+            trace_idx_ori_batch = self.trace_idx_ori[T_label.item()]    #60
+            equi_tgt_permute = equi_tgt[:, trace_idx_ori_batch]
+        else:
+            assert T_label.shape[0] == src.shape[0], "T_label.shape {}, src.shape {}".format(T_label.shape, src.shape)
+            trace_idx_ori_batch = self.trace_idx_ori[T_label, :]   # r(rotation)*r(anchor) -> b(rotation)*r(anchor)
+            equi_tgt_permute = torch.gather(equi_tgt, 1, trace_idx_ori_batch)   # b*r
+
+        # innerp = - (equi_tgt_permute * equi_src).sum(-1).mean(0)
+
+        _, equi_tgt_max_r = equi_tgt_permute.max(dim=1) # b
+        _, equi_src_max_r = equi_src.max(dim=1)         # b
+
+        cross_e1, accuracy = self.crossentropyloss(equi_tgt_permute, equi_src_max_r)
+        cross_e2, _ = self.crossentropyloss(equi_src, equi_tgt_max_r)
+        cross_e = cross_e1 + cross_e2
+        
+        # accuracy = torch.sum(equi_tgt_max_r == equi_src_max_r).float() / float(equi_tgt_permute.shape[0])
+
+        # print("\n equi_tgt.shape", equi_tgt.shape)
+        # print("\n equi_tgt_permute.shape", equi_tgt_permute.shape)
+        # print("\n T_label.shape", T_label.shape)
+        # print("\n trace_idx_ori_batch.shape", trace_idx_ori_batch.shape)
+        # print("\n self.trace_idx_ori.shape",  self.trace_idx_ori.shape)
+        # print("\n equi_tgt_max_r.shape", equi_tgt_max_r.shape)
+        # print("\n equi_src_max_r.shape", equi_src_max_r.shape)
+        # print("\n accuracy", accuracy, "\n")
+        equiv_info = [cross_e, accuracy]
+        
+        total_loss = inv_loss + self.beta * cross_e
+        return total_loss, inv_info, equiv_info
 
     def _forward_invariance(self, src, tgt):
         '''
@@ -374,8 +543,8 @@ class TripletBatchLoss(nn.Module):
         # r_loss = dist_func(src_wtsR, tgt_wts).mean()
 
         loss_type = self.attention_params['attention_type']
-        m = self.attention_params['attention_margin']
-        pretrain_step = self.attention_params['attention_pretrain_step']
+        # m = self.attention_params['attention_margin']
+        # pretrain_step = self.attention_params['attention_pretrain_step']
 
         #### DEPRECATED
         if src_wts.ndimension() == 3:

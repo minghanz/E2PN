@@ -1,3 +1,7 @@
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__),'vgtk') )
+
 from SPConvNets.trainer_3dmatch import Trainer
 from SPConvNets.options import opt as opt_3dmatch
 
@@ -14,15 +18,13 @@ SCENE_TO_TEST = [
 
 def config_opt_3dmatch(opt):
     opt.model.search_radius = 0.4
-    opt.model.flag = 'attention'
     opt.model.model = "inv_so3net_pn"
     opt.no_augmentation = True
 
     if opt.mode == 'train':
-        opt.npt = 16
         opt.batch_size = 1
         opt.num_iterations = 150000
-        opt.save_freq = 4000
+        opt.save_freq = 30000
         opt.train_lr.decay_step = 20000
     elif opt.mode == 'eval':
         opt.npt = 24
@@ -38,6 +40,6 @@ if __name__ == '__main__':
         trainer.train()
     elif opt_3dmatch.mode == 'eval':
         assert opt_3dmatch.resume_path is not None
-        opt_3dmatch.experiment_id = opt_3dmatch.resume_path.split('/')[2]
+        # opt_3dmatch.experiment_id = opt_3dmatch.resume_path.split('/')[2]
         trainer = Trainer(opt_3dmatch)
         trainer.eval(SCENE_TO_TEST)

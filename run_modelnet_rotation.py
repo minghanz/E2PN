@@ -1,8 +1,11 @@
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__),'vgtk') )
+
 from SPConvNets.trainer_modelnetRotation import Trainer 
 from SPConvNets.options import opt
 
 if __name__ == '__main__':
-    opt.model.flag = 'rotation'
     opt.model.model = 'reg_so3net'
 
     if opt.mode == 'train':
@@ -11,7 +14,7 @@ if __name__ == '__main__':
         opt.decay_rate = 0.97
         opt.decay_step = 3000
         opt.dropout_rate = 0.0
-        opt.train_loss.attention_loss_type = 'default'
+        opt.num_iterations = 80000
 
     trainer = Trainer(opt)
 

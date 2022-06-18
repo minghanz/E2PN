@@ -10,11 +10,15 @@ import os.path as osp
 
 class Trainer(vgtk.Trainer):
     def __init__(self, opt):
+        """Trainer for 3dmatch SE(3)-invariant descriptor learning. """
         super(Trainer, self).__init__(opt)
 
         if self.opt.train_loss.equi_alpha > 0:
             self.summary.register(['Loss', 'InvLoss', 'Pos', 'Neg', 'Acc', \
                 'EquiLoss', 'EquiPos', 'EquiNeg', 'EquiAcc' ])
+        elif self.opt.train_loss.equi_beta > 0:
+            self.summary.register(['Loss', 'InvLoss', 'Pos', 'Neg', 'Acc', \
+                'EquiLoss', 'EquiAcc' ])
         else:
             self.summary.register(['Loss', 'Pos', 'Neg', 'Acc'])
 
@@ -55,10 +59,12 @@ class Trainer(vgtk.Trainer):
 
 
     def _setup_metric(self):
-        self.anchors = self.model.get_anchor().to(self.opt.device)
+        # self.anchors = self.model.get_anchor().to(self.opt.device)
         self.metric = vgtk.loss.TripletBatchLoss(self.opt,\
-                                                 self.anchors,
-                                                 alpha = self.opt.train_loss.equi_alpha) \
+                                                 anchors = None, #self.anchors,
+                                                 alpha = self.opt.train_loss.equi_alpha, 
+                                                 beta = self.opt.train_loss.equi_beta,
+                                                )
 
     # For epoch-based training
     def epoch_step(self):
@@ -103,6 +109,11 @@ class Trainer(vgtk.Trainer):
             self.loss, inv_info, equi_info = self.metric(y_src, y_tgt, gt_T, yw_src, yw_tgt)
             invloss, pos_loss, neg_loss, accuracy = inv_info
             equiloss, equi_accuracy, equi_pos_loss, equi_neg_loss = equi_info
+        elif self.opt.train_loss.equi_beta > 0:
+            gt_T_label = data['T_label'].to(self.opt.device).reshape(-1)
+            self.loss, inv_info, equi_info = self.metric(y_src, y_tgt, gt_T_label, yw_src, yw_tgt)
+            invloss, accuracy, pos_loss, neg_loss = inv_info
+            equiloss, equi_accuracy = equi_info
         else:
             self.loss, accuracy, pos_loss, neg_loss = self.metric(y_src, y_tgt, gt_T)
             
@@ -122,6 +133,16 @@ class Trainer(vgtk.Trainer):
                 'EquiNeg': equi_neg_loss.item(),
                 'EquiAcc': 100 * equi_accuracy.item(),
             }
+        elif self.opt.train_loss.equi_beta > 0:
+            log_info = {
+                'Loss': self.loss.item(),
+                'InvLoss': invloss.item(),
+                'Pos': pos_loss.item(),
+                'Neg': neg_loss.item(),
+                'Acc': 100 * accuracy.item(),
+                'EquiLoss': equiloss.item(),
+                'EquiAcc': 100 * equi_accuracy.item(),
+            }
         else:
             log_info = {
                 'Loss': self.loss.item(),
@@ -135,7 +156,12 @@ class Trainer(vgtk.Trainer):
 
     def _print_running_stats(self, step):
         stats = self.summary.get()
-        self.logger.log('Training', f'{step}: {stats}')
+        
+        mem_used_max_GB = torch.cuda.max_memory_allocated() / (1024*1024*1024)
+        torch.cuda.reset_peak_memory_stats()
+        mem_str = f', Mem: {mem_used_max_GB:.3f}GB'
+
+        self.logger.log('Training', f'{step}: {stats}'+mem_str)
         # self.summary.reset(['Loss', 'Pos', 'Neg', 'Acc', 'InvAcc'])
 
     def test(self):
@@ -151,15 +177,17 @@ class Trainer(vgtk.Trainer):
         all_results = dict()
         for scene in select:
             assert osp.isdir(osp.join(self.opt.dataset_path, scene))
-            print(f"Working on scene {scene}...")
-            target_folder = osp.join('data/evaluate/3DMatch/', self.opt.experiment_id, scene, f'{self.opt.model.output_num}_dim')
+            self.logger.log('Evaluation', f"Working on scene {scene}...")
+            # target_folder = osp.join('data/evaluate/3DMatch/', self.opt.experiment_id, scene, f'{self.opt.model.output_num}_dim')
+            target_folder = osp.join(self.root_dir, 'data/evaluate/3DMatch/', scene, f'{self.opt.model.output_num}_dim')
             self._setup_eval_datasets(scene)
             self._generate(target_folder)
             # recalls: [tau, ratio]
-            results = eval3dmatch.evaluate_scene(self.opt.dataset_path, target_folder, scene)
+            results, total_recall = eval3dmatch.evaluate_scene(self.opt.dataset_path, target_folder, scene)
+            self.logger.log('Evaluation', f"Total recall: {total_recall:.4f}!")
             all_results[scene] = results        
         self._write_csv(all_results)
-        print("Done!")
+        self.logger.log('Evaluation', "Done!")
 
 
     def _generate(self, target_folder):
@@ -167,17 +195,19 @@ class Trainer(vgtk.Trainer):
             self.model.eval()
             bs = self.opt.batch_size
 
-            print("\n---------- Evaluating the network! ------------------")
+            self.logger.log('Generating', "---------- Evaluating the network! ------------------")
 
             ################### EVAL LOADER ###############################3
             from tqdm import tqdm
             for it, data in enumerate(self.dataset_eval):
+                torch.cuda.reset_peak_memory_stats()
+
                 sid = data['sid'].item()
                 # scene = data['scene']
 
                 checknan = lambda tensor: torch.sum(torch.isnan(tensor))
                 
-                print("\nWorking on fragment id", sid)
+                self.logger.log('Generating', "Working on fragment id {}".format(sid))
                 n_keypoints = data['clouds'].shape[0]
                 # 5000 x N x 3
                 clouds = data['clouds'].to(self.opt.device).squeeze()
@@ -193,11 +223,15 @@ class Trainer(vgtk.Trainer):
                     feature_buffer.append(feature_np)
                     # print("Batch counter at %d/%d"%(bi, npt), end='\r')
 
+                mem_used_max_GB = torch.cuda.max_memory_allocated() / (1024*1024*1024)
+                torch.cuda.reset_peak_memory_stats()
+                self.logger.log('Generating', f'Mem: {mem_used_max_GB:.3f}GB')
+
                 # target_folder = osp.join('data/evaluate/3DMatch/', self.opt.experiment_id, scene, f'{self.opt.model.output_num}_dim')
                 os.makedirs(target_folder, exist_ok=True)
                 feature_out = np.vstack(feature_buffer)
                 out_path = osp.join(target_folder, "feature%d.npy"%sid)
-                print(f"\nSaving features to {out_path}")
+                self.logger.log('Generating', f"Saving features to {out_path}")
                 np.save(out_path, feature_out)
             ######################################################################
 
@@ -205,7 +239,8 @@ class Trainer(vgtk.Trainer):
     def _write_csv(self, results):
         import csv
         from SPConvNets.datasets import evaluation_3dmatch as eval3dmatch
-        csvpath_root = osp.join('trained_models/evaluate/3DMatch/', self.opt.experiment_id)
+        # csvpath_root = osp.join('trained_models/evaluate/3DMatch/', self.opt.experiment_id)
+        csvpath_root = osp.join(self.root_dir, 'data/evaluate/3DMatch/')
         os.makedirs(csvpath_root, exist_ok=True)
         csvpath = osp.join( csvpath_root, 'recall.csv')
         with open(csvpath, 'w', newline='') as csvfile:
@@ -221,13 +256,17 @@ class Trainer(vgtk.Trainer):
                     row['tau_%.2f'%tau] = "%.2f"%ratio
                 writer.writerow(row)
 
-        ### print out the stats
-        all_recall = []
-        for scene in results.keys():
-            tau, ratio = results[scene][0]
-            print("%s recall is %.2f at tau %.2f"%(scene, ratio, tau))
-            all_recall.append(ratio)
+        overallpath = osp.join( csvpath_root, 'recall_overall.txt')
+        with open(overallpath, 'w') as f:
+            ### print out the stats
+            all_recall = []
+            for scene in results.keys():
+                tau, ratio = results[scene][0]
+                self.logger.log('Evaluation', " %s recall is %.2f at tau %.2f"%(scene, ratio, tau))
+                f.write("%s recall is %.2f at tau %.2f\n"%(scene, ratio, tau))
+                all_recall.append(ratio)
 
-        avg = np.array(all_recall).mean()
-        print("Average recall is %.2f !" % avg)
+            avg = np.array(all_recall).mean()
+            self.logger.log('Evaluation', "Average recall is %.2f !" % avg)
+            f.write("Average recall is %.2f !\n" % avg)
                 

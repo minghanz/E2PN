@@ -335,9 +335,9 @@ class InterZPConvGrouping(torch.autograd.Function):
 
 
 
-# [b, 3, n] x [b, 3, m] x r x k x [b, c, m] ->
-# [b, n, k] x [b, 3, n, k] x [b, c, n, k]
 def ball_query(query_points, support_points, radius, n_sample, support_feats=None):
+    """[b, 3, n] x [b, 3, m] x r x k x [b, c, m] ->
+    [b, n, k] x [b, 3, n, k] x [b, c, n, k]"""
     # TODO remove add_shadow_point here
     idx = pctk.ball_query_index(query_points, support_points, radius, n_sample)
     support_points = add_shadow_point(support_points)
@@ -370,6 +370,7 @@ def batched_index_select(input, dim, index):
 
 
 def inter_zpconv_grouping_naive(inter_idx, inter_w, feats):
+    """Aggregate the input features to the kernel points by weighted sum. """
     b, p, pnn = inter_idx.shape
     _, c, q, a = feats.shape
     device = inter_idx.device
@@ -381,7 +382,11 @@ def inter_zpconv_grouping_naive(inter_idx, inter_w, feats):
     # torch.cuda.synchronize()
     # print('timer3:', time.time()-end, new_feats.shape)
     # end = time.time()
-    new_feats = torch.einsum('bcpna,bpakn->bckpa', new_feats, inter_w).contiguous()
+    if inter_w.ndim == 5:
+        new_feats = torch.einsum('bcpna,bpakn->bckpa', new_feats, inter_w).contiguous()
+    else:
+        assert inter_w.ndim == 4, f"inter_w should be of size bpakn or bpkn, but get {inter_w.shape} instead"
+        new_feats = torch.einsum('bcpna,bpkn->bckpa', new_feats, inter_w).contiguous()
 
     # torch.cuda.synchronize()
     # print('timer4:', time.time()-end, new_feats.shape, inter_w.shape)
@@ -391,6 +396,7 @@ def inter_zpconv_grouping_naive(inter_idx, inter_w, feats):
 
 
 def inter_pooling_naive(inter_idx, sample_idx, feats, alpha=0.5):
+    """Mix the feature of the center points with their neighboring points. The center points are indexed by sample_idx. Return the blurred feature. """
     b, p, pnn = inter_idx.shape
     _, c, q, a = feats.shape
     
@@ -400,6 +406,8 @@ def inter_pooling_naive(inter_idx, sample_idx, feats, alpha=0.5):
 
 
 def inter_blurring_naive(inter_idx, feats, alpha=0.5):
+    """Mix the feature of the center points (all points here) with their neighboring points. Return the blurred feature. """
+    # TODO: add_shadow_feature seems non-necessary given the implementation of ball_query_cuda_kernel() in grouping_cuda_kernel.cu
     b, p, pnn = inter_idx.shape
     _, c, q, a = feats.shape
     assert p == q
@@ -408,16 +416,19 @@ def inter_blurring_naive(inter_idx, feats, alpha=0.5):
 
 
 # inter zpconv grouping
-# [b, 3, p1] x [b, 3, p2, a] -> [b, 3, p2, nn+1]
+# [b, 3, p1] -> [b, 3, p2, nn], [b, p2, nn], [b, p2], [b, 3, p2]
 def inter_zpconv_grouping_ball(xyz, stride, radius, n_neighbor, lazy_sample=True):
+    """Sample a set of center points using the stride, and find ball neighbors for them. 
+    Return the indices and coordinates of the sampled center points and their neighbors. """
 
     n_sample = math.ceil(xyz.shape[2] / stride)
     # [b, 3, p1] x [p2] -> [b,p2] x [b, 3, p2]
     idx, sample_xyz = pctk.furthest_sample(xyz, n_sample, lazy_sample)
-    # [b, p2, nn]
+    # [b, 3, p2] x [b, 3, p1] -> [b, p2, nn] x [b, 3, p2, nn]
     ball_idx, grouped_xyz = ball_query(sample_xyz, xyz, radius, n_neighbor)
-    # [b, 3, p1+1] x [b, p2, nn] -> [b, 3, p2, nn]
+    # [b, 3, p2, nn] x [b, 3, p2] -> [b, 3, p2, nn]
     grouped_xyz = grouped_xyz - sample_xyz.unsqueeze(3)
+    # [b, 3, p2, nn], [b, p2, nn], [b, p2], [b, 3, p2]
     return grouped_xyz, ball_idx, idx, sample_xyz
 
 # [b, 3, p2, nn] x [b, p2, nn] -> [b, p2, a, k, ann]

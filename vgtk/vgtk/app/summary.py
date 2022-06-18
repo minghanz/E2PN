@@ -2,6 +2,7 @@ import math
 
 class Summary():
     def __init__(self, momentum=0.9):
+        """Keep track of the count and the running average defined by the momentum. """
         self.items = []
         self.running_stats = {}
         self.counters = {}

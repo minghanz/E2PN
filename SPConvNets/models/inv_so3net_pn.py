@@ -61,6 +61,9 @@ def build_model(opt,
     input_radius = opt.model.search_radius
     kpconv = opt.model.kpconv
 
+    p_pool_first = opt.model.p_pool_first
+    permute_nl = opt.model.permute_nl
+
     na = 1 if opt.model.kpconv else opt.model.kanchor
 
     # to accomodate different input_num
@@ -136,7 +139,12 @@ def build_model(opt,
             # import ipdb; ipdb.set_trace()
 
             # one-inter one-intra policy
-            block_type = 'inter_block' if na != 60  else 'separable_block'
+            if na == 60:
+                block_type = 'separable_block' 
+            elif na == 12:
+                block_type = 'separable_s2_block'
+            else:
+                raise ValueError(f"na={na} not supported.")
 
             conv_param = {
                 'type': block_type,
@@ -168,6 +176,8 @@ def build_model(opt,
         'pooling': so3_pooling,
         'temperature': temperature,
         'kanchor': na,
+        'p_pool_first': p_pool_first,
+        'permute_nl': permute_nl,
     }
 
 

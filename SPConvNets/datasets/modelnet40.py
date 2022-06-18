@@ -8,27 +8,28 @@ import torch.utils.data as data
 import vgtk.pc as pctk
 import vgtk.point3d as p3dtk
 import vgtk.so3conv.functional as L
-from vgtk.functional import rotation_distance_np, label_relative_rotation_np
+from vgtk.functional import rotation_distance_np, label_relative_rotation_np, label_relative_rotation_simple
 from scipy.spatial.transform import Rotation as sciR
+
+import matplotlib.pyplot as plt
 
 class Dataloader_ModelNet40(data.Dataset):
     def __init__(self, opt, mode=None):
+        """For classification task. """
         super(Dataloader_ModelNet40, self).__init__()
         self.opt = opt
 
         # 'train' or 'eval'
         self.mode = opt.mode if mode is None else mode
 
-        # attention method: 'attention | rotation'
-        self.flag = opt.model.flag
 
-        self.anchors = L.get_anchors()
-
-        if self.flag == 'rotation':
-            cats = ['airplane']
-            print(f"[Dataloader]: USING ONLY THE {cats[0]} CATEGORY!!")
+        if self.opt.model.kanchor == 12:
+            self.anchors = L.get_anchorsV()
+            self.trace_idx_ori, self.trace_idx_rot = L.get_relativeV_index()
         else:
-            cats = os.listdir(opt.dataset_path)
+            self.anchors = L.get_anchors(self.opt.model.kanchor)
+
+        cats = os.listdir(opt.dataset_path)
 
         self.dataset_path = opt.dataset_path
         self.all_data = []
@@ -69,28 +70,39 @@ class Dataloader_ModelNet40(data.Dataset):
 
             _, R_label, R0 = rotation_distance_np(R, self.anchors)
 
-            if self.flag == 'rotation':
-                R = R0
+            if self.opt.model.kanchor == 12:
+                trace_idx_ori_true = self.trace_idx_ori[[R_label]]    # 1*12
+                label_anchor_aligned = self.trace_idx_ori == trace_idx_ori_true # 60*12
+            
+            # if self.flag == 'rotation':
+            #     R = R0
 
-        return {'pc':torch.from_numpy(pc.astype(np.float32)),
+        in_dict = {'pc':torch.from_numpy(pc.astype(np.float32)),
                 'label':torch.from_numpy(data['label'].flatten()).long(),
                 'fn': data['name'][0],
                 'R': R,
                 'R_label': torch.Tensor([R_label]).long(),
                }
+               
+        if self.opt.model.kanchor == 12:
+            in_dict['anchor_label'] = torch.from_numpy(label_anchor_aligned.astype(np.float32))
+        return in_dict
 
-# for relative rotation alignment
 class Dataloader_ModelNet40Alignment(data.Dataset):
     def __init__(self, opt, mode=None):
+        """For relative rotation alignment task. """
         super(Dataloader_ModelNet40Alignment, self).__init__()
         self.opt = opt
 
         # 'train' or 'eval'
         self.mode = opt.mode if mode is None else mode
 
-        # attention method: 'attention | rotation'
-        self.flag = opt.model.flag
-        self.anchors = L.get_anchors(self.opt.model.kanchor)
+        # attention method: 'attention | rotation | permutation'
+        if self.opt.model.kanchor == 12:
+            self.anchors = L.get_anchorsV()
+            self.trace_idx_ori, self.trace_idx_rot = L.get_relativeV_index()
+        else:
+            self.anchors = L.get_anchors(self.opt.model.kanchor)
 
         # if self.flag == 'rotation':
         #     cats = ['airplane']
@@ -130,6 +142,8 @@ class Dataloader_ModelNet40Alignment(data.Dataset):
         #     pc_src, R_src = pctk.rotate_point_cloud(pc)
 
         pc_src, R_src = pctk.rotate_point_cloud(pc)
+        ### pc_src.T = R_src * pc.T (3*N)
+
         # target shape
 
         # pc_tgt, R_tgt = pctk.rotate_point_cloud(pc)
@@ -149,12 +163,45 @@ class Dataloader_ModelNet40Alignment(data.Dataset):
         # R_label = np.argmax(np.einsum('abii->ab', RR_regress),axis=1)
         # idxs = np.vstack([np.arange(R_label.shape[0]), R_label]).T
         # R = RR_regress[idxs[:,0], idxs[:,1]]
-        R, R_label = label_relative_rotation_np(self.anchors, T)
+        if self.opt.model.kanchor == 12:
+            R, R_label = label_relative_rotation_simple(self.anchors, T)
+            trace_idx_rot_true = self.trace_idx_rot[[R_label]]    # 1*12
+            label_anchor_aligned = self.trace_idx_rot == trace_idx_rot_true # 60*12
+        else:
+            R, R_label = label_relative_rotation_np(self.anchors, T)
+
         pc_tensor = np.stack([pc_src, pc_tgt])
 
-        return {'pc':torch.from_numpy(pc_tensor.astype(np.float32)),
+        in_dict =  {'pc':torch.from_numpy(pc_tensor.astype(np.float32)),
                 'fn': data['name'][0],
                 'T' : torch.from_numpy(T.astype(np.float32)),
                 'R': torch.from_numpy(R.astype(np.float32)),
-                'R_label': torch.Tensor([R_label]).long(),
+                'R_label': torch.Tensor(np.array([R_label])).long(),
                }
+        if self.opt.model.kanchor == 12:
+            in_dict['anchor_label'] = torch.from_numpy(label_anchor_aligned.astype(np.float32))
+
+        # ######## visualize pc_tgt and pc_src
+        # fig = plt.figure()
+
+        # ax = fig.add_subplot(111, projection='3d')
+
+        # ax.scatter(pc_tgt[:,0],pc_tgt[:,1],pc_tgt[:,2], marker=".", s=2)
+        # ax.set_axis_off()
+
+        # # plt.show()
+        # plt.savefig("fig_tgt_{:02d}.png".format(index))
+        # plt.close()
+
+        # fig = plt.figure()
+
+        # ax = fig.add_subplot(111, projection='3d')
+
+        # ax.scatter(pc_src[:,0],pc_src[:,1],pc_src[:,2], marker=".", s=2)
+        # ax.set_axis_off()
+
+        # # plt.show()
+        # plt.savefig("fig_src_{:02d}.png".format(index))
+        # plt.close()
+        # ######### end visualize
+        return in_dict

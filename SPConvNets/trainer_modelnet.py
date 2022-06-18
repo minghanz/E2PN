@@ -8,20 +8,24 @@ import numpy as np
 import os
 import torch.nn.functional as F
 from sklearn.neighbors import KDTree
+from SPConvNets.datasets.evaluation.retrieval import modelnet_retrieval_mAP
 
 class Trainer(vgtk.Trainer):
     def __init__(self, opt):
-
+        """Trainer for modelnet40 classification. """
         self.attention_model = opt.model.flag.startswith('attention') and opt.debug_mode != 'knownatt'
+        self.attention_loss = self.attention_model and opt.train_loss.cls_attention_loss
+        self.att_permute_loss = opt.model.flag == 'permutation'
         super(Trainer, self).__init__(opt)
 
-        if self.attention_model:
+        if self.attention_loss or self.att_permute_loss:
             self.summary.register(['Loss', 'Acc', 'R_Loss', 'R_Acc'])
         else:
             self.summary.register(['Loss', 'Acc'])
         self.epoch_counter = 0
         self.iter_counter = 0
         self.test_accs = []
+        self.best_acc = None
 
     def _setup_datasets(self):
         if self.opt.mode == 'train':
@@ -48,11 +52,19 @@ class Trainer(vgtk.Trainer):
         module = import_module('SPConvNets.models')
         self.model = getattr(module, self.opt.model.model).build_model_from(self.opt, param_outfile)
 
+        pytorch_total_params = sum(p.numel() for p in self.model.parameters())
+        self.logger.log("Training", "Total number of parameters: {}".format(pytorch_total_params))
+
     def _setup_metric(self):
-        if self.attention_model:
+        if self.attention_loss:
+            ### loss on category and rotation classification
             self.metric = vgtk.AttentionCrossEntropyLoss(self.opt.train_loss.attention_loss_type, self.opt.train_loss.attention_margin)
             # self.r_metric = AnchorMatchingLoss()
+        elif self.att_permute_loss:
+            ### loss on category classification and anchor alignment
+            self.metric = vgtk.AttPermuteCrossEntropyLoss(self.opt.train_loss.attention_loss_type, self.opt.train_loss.attention_margin, self.opt.device)
         else:
+            ### loss on category classification only
             self.metric = vgtk.CrossEntropyLoss()
 
     # For epoch-based training
@@ -88,7 +100,7 @@ class Trainer(vgtk.Trainer):
         # import ipdb; ipdb.set_trace()
         ##################### --------------------------------------------
 
-        pred, feat = self.model(in_tensors, in_Rlabel)
+        pred, feat, x_feat = self.model(in_tensors, in_Rlabel)
 
         ##############################################
         # predR, featR = self.model(in_tensorsR, in_Rlabel)
@@ -99,9 +111,13 @@ class Trainer(vgtk.Trainer):
 
         self.optimizer.zero_grad()
 
-        if self.attention_model:
+        if self.attention_loss:
             in_rot_label = data['R_label'].to(self.opt.device).reshape(bdim)
             self.loss, cls_loss, r_loss, acc, r_acc = self.metric(pred, in_label, feat, in_rot_label, 2000)
+        elif self.att_permute_loss:
+            in_rot_label = data['R_label'].to(self.opt.device).reshape(bdim)
+            in_anchor_label = data['anchor_label'].to(self.opt.device)
+            self.loss, cls_loss, r_loss, acc, r_acc = self.metric(pred, in_label, feat, in_rot_label, 2000, in_anchor_label)
         else:
             cls_loss, acc = self.metric(pred, in_label)
             self.loss = cls_loss
@@ -110,7 +126,7 @@ class Trainer(vgtk.Trainer):
         self.optimizer.step()
 
         # Log training stats
-        if self.attention_model:
+        if self.attention_loss or self.att_permute_loss:
             log_info = {
                 'Loss': cls_loss.item(),
                 'Acc': 100 * acc.item(),
@@ -128,17 +144,23 @@ class Trainer(vgtk.Trainer):
 
     def _print_running_stats(self, step):
         stats = self.summary.get()
-        self.logger.log('Training', f'{step}: {stats}')
+        
+        mem_used_max_GB = torch.cuda.max_memory_allocated() / (1024*1024*1024)
+        torch.cuda.reset_peak_memory_stats()
+        mem_str = f', Mem: {mem_used_max_GB:.3f}GB'
+
+        self.logger.log('Training', f'{step}: {stats}'+mem_str)
         # self.summary.reset(['Loss', 'Pos', 'Neg', 'Acc', 'InvAcc'])
 
     def test(self):
-        self.eval()
-        return None
+        new_best = self.eval()
+        return new_best
 
     def eval(self):
         self.logger.log('Testing','Evaluating test set!')
         self.model.eval()
         self.metric.eval()
+        torch.cuda.reset_peak_memory_stats()
 
         ################## DEBUG ###############################
         # for module in self.model.modules():
@@ -165,9 +187,9 @@ class Trainer(vgtk.Trainer):
                 in_label = data['label'].to(self.opt.device).reshape(-1)
                 in_Rlabel = data['R_label'].to(self.opt.device) if self.opt.debug_mode == 'knownatt' else None
 
-                pred, feat = self.model(in_tensors, in_Rlabel)
+                pred, feat, x_feat = self.model(in_tensors, in_Rlabel)
 
-                if self.attention_model:
+                if self.attention_loss:
                     in_rot_label = data['R_label'].to(self.opt.device).reshape(bdim)
                     loss, cls_loss, r_loss, acc, r_acc = self.metric(pred, in_label, feat, in_rot_label, 2000)
                     attention = F.softmax(feat,1)
@@ -180,32 +202,47 @@ class Trainer(vgtk.Trainer):
                     # labels = data['label'].cpu().numpy().reshape(-1)
                     # for i in range(max_id.shape[0]):
                     #     lmc[labels[i], max_id[i]] += 1
+                elif self.att_permute_loss:
+                    in_rot_label = data['R_label'].to(self.opt.device).reshape(bdim)
+                    in_anchor_label = data['anchor_label'].to(self.opt.device)
+                    loss, cls_loss, r_loss, acc, r_acc = self.metric(pred, in_label, feat, in_rot_label, 2000, in_anchor_label)
                 else:
                     cls_loss, acc = self.metric(pred, in_label)
                     loss = cls_loss
 
                 all_labels.append(in_label.cpu().numpy())
-                all_feats.append(feat.cpu().numpy())
+                all_feats.append(x_feat.cpu().numpy())  # feat
 
-                accs.append(acc)
+                accs.append(acc.cpu())
                 self.logger.log("Testing", "Accuracy: %.1f, Loss: %.2f!"%(100*acc.item(), loss.item()))
-                if self.attention_model:
+                if self.attention_loss or self.att_permute_loss:
                     self.logger.log("Testing", "Rot Acc: %.1f, Rot Loss: %.2f!"%(100*r_acc.item(), r_loss.item()))
 
             accs = np.array(accs, dtype=np.float32)
+            mean_acc = 100*accs.mean()
+            self.logger.log('Testing', 'Average accuracy is %.2f!!!!'%(mean_acc))
+            self.test_accs.append(mean_acc)
 
-            self.logger.log('Testing', 'Average accuracy is %.2f!!!!'%(100*accs.mean()))
-            self.test_accs.append(100*accs.mean())
-            best_acc = np.array(self.test_accs).max()
-            self.logger.log('Testing', 'Best accuracy so far is %.2f!!!!'%(best_acc))
+            new_best = self.best_acc is None or mean_acc > self.best_acc
+            if new_best:
+                self.best_acc = mean_acc
+            self.logger.log('Testing', 'Best accuracy so far is %.2f!!!!'%(self.best_acc))
+
+            mem_used_max_GB = torch.cuda.max_memory_allocated() / (1024*1024*1024)
+            torch.cuda.reset_peak_memory_stats()
+            self.logger.log('Testing', f'Mem: {mem_used_max_GB:.3f}GB')
 
             # self.logger.log("Testing", 'Here to peek at the lmc')
             # self.logger.log("Testing", str(lmc))
             # import ipdb; ipdb.set_trace()
-            # n = 1
-            # mAP = modelnet_retrieval_mAP(all_feats,all_labels,n)
-            # self.logger.log('Testing', 'Mean average precision at %d is %f!!!!'%(n, mAP))
+            n = 1
+            all_feats = np.concatenate(all_feats, axis=0)
+            all_labels = np.concatenate(all_labels, axis=0)
+            self.logger.log("Testing", "all_feats.shape, {}, all_labels.shape, {}".format(all_feats.shape, all_labels.shape))
+            mAP = modelnet_retrieval_mAP(all_feats,all_labels,n)
+            self.logger.log('Testing', 'Mean average precision at %d is %f!!!!'%(n, mAP))
 
         self.model.train()
         self.metric.train()
 
+        return new_best

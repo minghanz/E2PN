@@ -1,5 +1,8 @@
 trained_models/
 
+*.pth
+*.out
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

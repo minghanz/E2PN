@@ -62,6 +62,7 @@ def build_model(opt,
     temperature = opt.train_loss.temperature
     so3_pooling =  opt.model.flag
     na = 1 if opt.model.kpconv else opt.model.kanchor
+    feat_all_anchors = opt.model.feat_all_anchors
 
     if input_num > 1024:
         sampling_ratio /= (input_num / 1024)
@@ -124,7 +125,15 @@ def build_model(opt,
             print(f'radius ratio: {radius_ratio[nidx]}')
 
             # one-inter one-intra policy
-            block_type = 'inter_block' if na<60 else 'separable_block'
+            # block_type = 'inter_block' if na<60 else 'separable_block'
+            if na == 60:
+                block_type = 'separable_block' 
+            elif na == 12:
+                block_type = 'separable_s2_block'
+            elif na < 60:
+                block_type = 'inter_block'
+            else:
+                raise ValueError(f"na={na} not supported.")
             conv_param = {
                 'type': block_type,
                 'args': {
@@ -157,11 +166,12 @@ def build_model(opt,
             'pooling': so3_pooling,
             'temperature': temperature,
             'kanchor':na,
+            'feat_all_anchors':feat_all_anchors,
     }
 
     if to_file is not None:
         with open(to_file, 'w') as outfile:
-            json.dump(params, outfile)
+            json.dump(params, outfile, indent=4)
 
     model = ClsSO3ConvModel(params).to(device)
     return model

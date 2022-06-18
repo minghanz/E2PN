@@ -36,7 +36,7 @@ class Trainer():
         os.makedirs(self.root_dir, exist_ok=True)
 
         # saving opt
-        opt_path = os.path.join(self.root_dir, 'opt.txt')
+        opt_path = os.path.join(self.root_dir, 'opt.json')
         # TODO: hierarchical args are not compatible wit json dump
         with open(opt_path, 'w') as fout:
             json.dump(opt_dict, fout, indent=2)
@@ -93,7 +93,7 @@ class Trainer():
         self.model.eval()
 
     def train_iter(self):
-        for i in range(self.opt.num_iterations):
+        for i in range(self.opt.num_iterations+1):
             self.timer.set_point('train_iter')
             self.lr_schedule.step()
             self.step()
@@ -107,9 +107,14 @@ class Trainer():
                     step = f'Iter {i}'
                 self._print_running_stats(step)
 
+            if i > 0 and i % self.opt.eval_freq == 0:
+                new_best = self.test()
+                if new_best:
+                    self.logger.log('Testing', 'New best! Saving this model. ')
+                    self._save_network('best')
+
             if i > 0 and i % self.opt.save_freq == 0:
                 self._save_network(f'Iter{i}')
-                self.test()
 
     def train_epoch(self):
         for i in range(self.opt.num_epochs):

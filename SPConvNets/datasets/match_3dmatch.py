@@ -11,7 +11,7 @@ from sklearn.neighbors import NearestNeighbors as nnbrs
 from multiprocessing import Pool
 import vgtk.so3conv.functional as L
 import vgtk.pc as pctk
-from vgtk.functional import RigidMatrix
+from vgtk.functional import RigidMatrix, label_relative_rotation_simple
 
 # ------------------------ utilities for 3DMatch Data ---------------------------
 
@@ -294,6 +294,11 @@ class FragmentLoader(data.Dataset):
 
         print('[Dataloader] Training set length:', len(self.kptfiles))
 
+        if self.opt.model.kanchor == 12:
+            self.anchors = L.get_anchorsV()
+        else:
+            self.anchors = L.get_anchors(self.opt.model.kanchor)
+            
     def __len__(self):
         return len(self.kptfiles)
 
@@ -332,11 +337,14 @@ class FragmentLoader(data.Dataset):
         inputA = np.array(inputA)
         inputB = np.array(inputB)
         
+        R, R_label = label_relative_rotation_simple(self.anchors, T)
+
         data = {'src': torch.from_numpy(inputA.astype(np.float32)),\
                 'tgt': torch.from_numpy(inputB.astype(np.float32)),\
                 'frag_src': pcdA,\
                 'frag_tgt': pcdB,\
                 'T': torch.from_numpy(T.astype(np.float32)),\
+                'T_label': torch.from_numpy(np.array([R_label])).long(),    
                 'fn': meta.id}
         return data
 
