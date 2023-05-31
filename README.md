@@ -142,10 +142,11 @@ model --kanchor 12
 If you find our project useful in your research, please consider citing:
 
 ```
-@article{zhu20222,
-  title={E $\^{} 2$ PN: Efficient SE (3)-Equivariant Point Network},
+@inproceedings{zhu2023e2pn,
+  title={E2PN: Efficient SE (3)-equivariant point network},
   author={Zhu, Minghan and Ghaffari, Maani and Clark, William A and Peng, Huei},
-  journal={arXiv preprint arXiv:2206.05398},
-  year={2022}
+  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  pages={1223--1232},
+  year={2023}
 }
 ```
