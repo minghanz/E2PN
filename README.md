@@ -1,7 +1,7 @@
 
 # E2PN: Efficient SE(3)-Equivariant Point Network
 
-This repository contains the code (in PyTorch) for [E2PN: Efficient SE(3)-Equivariant Point Network](https://arxiv.org/abs/2206.05398). The implementation is developed based on an open-sourced existing work: [Equivariant Point Network for 3D Point Cloud Analysis](https://github.com/nintendops/EPN_PointCloud) (EPN). 
+This repository contains the code (in PyTorch) for the CVPR 2023 paper [E2PN: Efficient SE(3)-Equivariant Point Network](https://arxiv.org/abs/2206.05398). The implementation is developed based on an open-sourced existing work [EPN](https://github.com/nintendops/EPN_PointCloud). 
 
 
 ## Contents
