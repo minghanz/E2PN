@@ -16,7 +16,7 @@ class Trainer(vgtk.Trainer):
         if self.opt.train_loss.equi_alpha > 0:
             self.summary.register(['Loss', 'InvLoss', 'Pos', 'Neg', 'Acc', \
                 'EquiLoss', 'EquiPos', 'EquiNeg', 'EquiAcc' ])
-        elif self.opt.train_loss.equi_beta > 0:
+        elif self.opt.train_loss.equi_beta > 0 or self.opt.train_loss.equi_gamma > 0 or self.opt.train_loss.equi_eta > 0:
             self.summary.register(['Loss', 'InvLoss', 'Pos', 'Neg', 'Acc', \
                 'EquiLoss', 'EquiAcc' ])
         else:
@@ -29,7 +29,7 @@ class Trainer(vgtk.Trainer):
 
         if self.opt.mode == 'train':
             dataset = FragmentLoader(self.opt, self.opt.model.search_radius, kptname=self.opt.dataset, \
-                                     use_normals=self.opt.model.normals, npt=self.opt.npt)
+                                     use_normals=self.opt.model.normals, npt=self.opt.npt, normal_for_sup=self.opt.model.normal_for_sup)
 
             sampler = PointCloudPairSampler(len(dataset))
 
@@ -64,6 +64,9 @@ class Trainer(vgtk.Trainer):
                                                  anchors = None, #self.anchors,
                                                  alpha = self.opt.train_loss.equi_alpha, 
                                                  beta = self.opt.train_loss.equi_beta,
+                                                 gamma = self.opt.train_loss.equi_gamma,
+                                                 eta = self.opt.train_loss.equi_eta,
+                                                 use_innerp = self.opt.train_loss.use_innerp,
                                                 )
 
     # For epoch-based training
@@ -109,11 +112,19 @@ class Trainer(vgtk.Trainer):
             self.loss, inv_info, equi_info = self.metric(y_src, y_tgt, gt_T, yw_src, yw_tgt)
             invloss, pos_loss, neg_loss, accuracy = inv_info
             equiloss, equi_accuracy, equi_pos_loss, equi_neg_loss = equi_info
-        elif self.opt.train_loss.equi_beta > 0:
+        elif self.opt.train_loss.equi_beta > 0 or self.opt.train_loss.equi_gamma > 0:
             gt_T_label = data['T_label'].to(self.opt.device).reshape(-1)
             self.loss, inv_info, equi_info = self.metric(y_src, y_tgt, gt_T_label, yw_src, yw_tgt)
             invloss, accuracy, pos_loss, neg_loss = inv_info
             equiloss, equi_accuracy = equi_info
+        elif self.opt.train_loss.equi_eta > 0:
+            data['normal_label_src'] = data['normal_label_src'].to(self.opt.device).view(-1)
+            data['normal_label_tgt'] = data['normal_label_tgt'].to(self.opt.device).view(-1)
+            gt_T_label = [data['normal_label_src'], data['normal_label_tgt']]
+            self.loss, inv_info, equi_info = self.metric(y_src, y_tgt, gt_T_label, yw_src, yw_tgt)
+            invloss, accuracy, pos_loss, neg_loss = inv_info
+            equiloss, equi_accuracy = equi_info
+
         else:
             self.loss, accuracy, pos_loss, neg_loss = self.metric(y_src, y_tgt, gt_T)
             
@@ -133,7 +144,7 @@ class Trainer(vgtk.Trainer):
                 'EquiNeg': equi_neg_loss.item(),
                 'EquiAcc': 100 * equi_accuracy.item(),
             }
-        elif self.opt.train_loss.equi_beta > 0:
+        elif self.opt.train_loss.equi_beta > 0 or self.opt.train_loss.equi_gamma > 0 or self.opt.train_loss.equi_eta > 0:
             log_info = {
                 'Loss': self.loss.item(),
                 'InvLoss': invloss.item(),

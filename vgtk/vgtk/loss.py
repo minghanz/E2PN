@@ -75,14 +75,22 @@ class AttentionCrossEntropyLoss(torch.nn.Module):
         return loss, cls_loss, r_loss, acc, racc
 
 class AttPermuteCrossEntropyLoss(torch.nn.Module):
-    def __init__(self, loss_type, loss_margin, device):
+    def __init__(self, loss_type, loss_margin, device, anchor_ab_loss, cross_ab, cross_ab_T):
         """CrossEntropyLoss on category and BCEWithLogitsLoss on anchors. """
         super(AttPermuteCrossEntropyLoss, self).__init__()
         self.metric = CrossEntropyLoss()
         self.loss_type = loss_type
         self.loss_margin = loss_margin
         self.iter_counter = 0
-        self.bn_classifier = nn.BCEWithLogitsLoss(pos_weight=torch.ones([1], device=device)*12) # pos_weight has to be a tensor on the correct device
+        self.anchor_ab_loss = anchor_ab_loss
+        self.cross_ab = cross_ab
+        self.cross_ab_T = cross_ab_T
+        if self.cross_ab:
+            assert self.anchor_ab_loss, 'cross_ab is valid only if anchor_ab_loss is True'
+            self.bn_classifier = nn.CrossEntropyLoss()
+        else:
+            positive_weight = 11 #11 = (12-1)/1, 11 = (720-60)/60  # 11/10/2022, previously 12
+            self.bn_classifier = nn.BCEWithLogitsLoss(pos_weight=torch.ones([1], device=device)*positive_weight) # pos_weight has to be a tensor on the correct device
 
     def forward(self, pred, label, wts, rlabel, pretrain_step=2000, anchor_label=None):
         """
@@ -97,7 +105,12 @@ class AttPermuteCrossEntropyLoss(torch.nn.Module):
         
         ### rotation classification loss
         # binary loss on the anchors
-        r_loss = self.bn_classifier(wts.reshape(-1), anchor_label.reshape(-1) )   #[-1], [-1], labels also need to be float
+        if self.cross_ab:
+            if self.cross_ab_T:
+                wts = wts.transpose(1,2)
+            r_loss = self.bn_classifier(wts, anchor_label)  # b*12*12, b*12
+        else:
+            r_loss = self.bn_classifier(wts.reshape(-1), anchor_label.reshape(-1) )   #[-1], [-1], labels also need to be float
 
         # cross entropy loss on the rotations
         confidence = torch.sigmoid(wts)
@@ -143,7 +156,7 @@ def batched_select_anchor(labels, y, rotation_mapping):
     return pred_RAnchor
 
 class MultiTaskDetectionLoss(torch.nn.Module):
-    def __init__(self, anchors, nr=4, w=10, threshold=1.0, s2_mode=False, r_cls_loss=False):
+    def __init__(self, anchors, rot_ref_tgt, nr=4, w=10, threshold=1.0, s2_mode=False, r_cls_loss=False, topk=1, writer=None, logger=None):
         """Classification and regression loss on rotations. """
         super(MultiTaskDetectionLoss, self).__init__()
         self.classifier = CrossEntropyLoss()
@@ -156,6 +169,10 @@ class MultiTaskDetectionLoss(torch.nn.Module):
 
         self.s2_mode = s2_mode
         self.r_cls_loss = r_cls_loss
+        self.rot_ref_tgt = rot_ref_tgt
+        self.topk = topk
+        self.writer = writer
+        self.logger = logger
         self.bn_classifier = nn.BCEWithLogitsLoss(pos_weight=torch.ones([1], device=anchors.device)*12) # pos_weight has to be a tensor on the correct device
 
     def forward_simple(self, wts, label, y, gt_R, gt_T, anchor_label):
@@ -189,16 +206,94 @@ class MultiTaskDetectionLoss(torch.nn.Module):
         if self.r_cls_loss:
             cls_loss = cls_loss + cls_loss_r
 
-        _, max_r = torch.max(confidence_r, 1)  # b
-        anchor_pred = self.anchors[max_r]
-        R_pred = rotation_mapping(y).view(b,3,3).contiguous()
-        pred_R = torch.matmul(R_pred, anchor_pred)
 
-        gt_R_for_anchor_pred = torch.einsum("bij,bkj->bik", gt_T, anchor_pred)
-        
-        # option 1: l2 loss for the prediction at each "tight" anchor pair
-        l2_loss = torch.pow(gt_R_for_anchor_pred - R_pred,2).mean()
-        loss = cls_loss + self.w * l2_loss
+        if self.logger is not None and self.iter_counter % 1000 == 0:
+            confidence_softmax1 = F.softmax(wts.mean(-1), 1).detach()
+            # confidence_softmax2 = F.softmax(confidence_r, 1).detach()
+            # confidence_softmax3 = F.softmax(confidence.mean(-1), 1).detach()
+            # self.logger.log('Loss', f'conf1 top 6: {torch.topk(confidence_softmax1, 6, 1)[0]}')
+            # self.logger.log('Loss', f'conf2 top 10: {torch.topk(confidence_softmax2, 10, 1)[0]}')
+            # self.logger.log('Loss', f'conf3 top 10: {torch.topk(confidence_softmax3, 10, 1)[0]}')
+        if self.topk == 1:
+            _, max_r = torch.max(confidence_r, 1)  # b
+            anchor_pred = self.anchors[max_r]
+            R_pred = rotation_mapping(y).view(b,3,3).contiguous()
+            if self.rot_ref_tgt:
+                pred_R = torch.matmul(anchor_pred, R_pred)
+                gt_R_for_anchor_pred = torch.einsum("bji,bjk->bik", anchor_pred, gt_T)
+            else:
+                pred_R = torch.matmul(R_pred, anchor_pred)
+
+                gt_R_for_anchor_pred = torch.einsum("bij,bkj->bik", gt_T, anchor_pred)
+            
+            # option 1: l2 loss for the prediction at each "tight" anchor pair
+            l2_loss = torch.pow(gt_R_for_anchor_pred - R_pred,2).mean()
+            loss = cls_loss + self.w * l2_loss
+        else:
+            confidence_softmax = F.softmax(wts.mean(-1), 1).detach()
+            # if self.training:
+            #     self.writer.add_histogram("wtsmean_sfm_tr", confidence_softmax, self.iter_counter)
+            #     self.writer.add_histogram("cfsgsum_sfm_tr", F.softmax(confidence_r, 1).detach(), self.iter_counter)
+            # else:
+            #     self.writer.add_histogram("wtsmean_sfm_ev", confidence_softmax, self.iter_counter)
+            #     self.writer.add_histogram("cfsgsum_sfm_ev", F.softmax(confidence_r, 1).detach(), self.iter_counter)
+            
+            top_conf, top_idx = torch.topk(confidence_softmax, self.topk, 1)    # b, topk
+
+            top_mask = top_conf > 0.1
+            top_mask_all = torch.ones_like(top_mask)
+
+            top_mask_row = top_mask.sum(1)
+            top_mask_more_than_one = top_mask_row > 1
+            top_mask_row = top_mask_row.to(torch.bool)
+            top_mask_zero = ~top_mask_row
+            top_mask_ambiguous = top_mask_more_than_one | top_mask_zero
+            top_mask_row = top_mask_row.unsqueeze(1).expand_as(top_mask)
+            # top_mask_max[:,0] = True
+
+            top_mask_final = torch.where(top_mask_row, top_mask, top_mask_all)
+            top_conf = torch.where(top_mask_final, top_conf, torch.zeros_like(top_conf))
+            top_conf = F.normalize(top_conf, p=1, dim=1)# b, topk
+
+            anchor_pred = self.anchors[top_idx] # b, topk, 3, 3
+            anchor_pred_top = anchor_pred[:, 0]
+            y_top = y[:,self.topk]
+            R_pred_top = rotation_mapping(y_top).view(b,3,3).contiguous()
+            y = y[:, :self.topk]
+            R_pred = rotation_mapping(y.reshape(-1, nr)).view(b, self.topk,3,3).contiguous()
+            if self.rot_ref_tgt:
+                pred_R = torch.einsum('btij, btjk->btik', anchor_pred, R_pred)
+                gt_R_for_anchor_pred = torch.einsum("btji,bjk->btik", anchor_pred, gt_T)
+
+                pred_R_top = torch.matmul(anchor_pred_top, R_pred_top)
+                gt_R_for_anchor_pred_top = torch.einsum("bji,bjk->bik", anchor_pred_top, gt_T)
+            else:
+                pred_R = torch.einsum('btij, btjk->btik', R_pred, anchor_pred)
+                gt_R_for_anchor_pred = torch.einsum("btij,btkj->btik", gt_T, anchor_pred)
+                
+                pred_R_top = torch.matmul(R_pred_top, anchor_pred_top)
+                gt_R_for_anchor_pred_top = torch.einsum("bij,bkj->bik", gt_T, anchor_pred_top)
+
+            # pred_R = so3_mean(pred_R, top_conf)
+            pred_R = pred_R[:,0]    # bik
+
+            pred_R = torch.where(top_mask_ambiguous.reshape(b,1,1).expand_as(pred_R), pred_R, pred_R_top)
+
+            # l2_loss = torch.pow(true_R - pred_R,2).mean()
+            l2_loss_ambiguous = torch.pow(gt_R_for_anchor_pred - R_pred,2).mean((2,3))
+            # l2_loss_ambiguous = (l2_loss_ambiguous * top_conf).sum(1)
+            l2_loss_ambiguous = l2_loss_ambiguous[:, 0]
+
+            l2_loss_max = torch.pow(gt_R_for_anchor_pred_top - R_pred_top,2).mean((1,2))
+
+            l2_loss = torch.where(top_mask_ambiguous, l2_loss_ambiguous, l2_loss_max).mean()
+
+            if self.logger is not None and self.iter_counter % 1000 == 0:
+                self.logger.log('Loss', f'top_mask_ambiguous: {top_mask_ambiguous}')
+                self.logger.log('Loss', f'l2_loss_ambiguous: {l2_loss_ambiguous}')
+                self.logger.log('Loss', f'l2_loss_max: {l2_loss_max}')
+
+            loss = cls_loss + self.w * l2_loss
 
         if self.training:
             self.iter_counter += 1
@@ -350,7 +445,7 @@ def batch_hard_negative_mining(dist_mat):
 class TripletBatchLoss(nn.Module):
     def __init__(self, opt, anchors=None, sigma=2e-1, \
                  interpolation='spherical', alpha=0.0,
-                 beta=0.0,
+                 beta=0.0, gamma=0.0, eta=0.0, use_innerp=False,
                  ):
         '''
             anchors: na x 3 x 3, default anchor rotations
@@ -361,20 +456,49 @@ class TripletBatchLoss(nn.Module):
         '''
         super(TripletBatchLoss, self).__init__()
         
+        self.alpha = alpha
+        self.beta = beta    # for permute loss
+        self.gamma = gamma    # for anchor alignment loss
+        self.eta = eta  # for normal classification loss
+        self.sigma = sigma
+        self.use_innerp = use_innerp
+
         if anchors is None:
             if opt.model.kanchor == 12:
                 anchors = sgtk.get_anchorsV()
-                trace_idx_ori, trace_idx_rot = sgtk.get_relativeVR_index(full=True)
-                self.register_buffer("trace_idx_ori", torch.tensor(trace_idx_ori, dtype=torch.long).to(device=opt.device))# 60*60 da
-                self.register_buffer("trace_idx_rot", torch.tensor(trace_idx_rot, dtype=torch.long).to(device=opt.device))# 60*60 db
-                # self.trace_idx_ori = torch.nn.Parameter(torch.tensor(trace_idx_ori, dtype=torch.long),
-                #                 requires_grad=False)   # 60*60 da
-                # self.trace_idx_rot = torch.nn.Parameter(torch.tensor(trace_idx_rot, dtype=torch.long),
-                #                 requires_grad=False)   # 60*60 db
+                anchors = torch.tensor(anchors).to(device=opt.device)
+                if self.beta > 0:
+                    trace_idx_ori, trace_idx_rot = sgtk.get_relativeVR_index(full=True)
+                    self.register_buffer("trace_idx_ori", torch.tensor(trace_idx_ori, dtype=torch.long).to(device=opt.device))# 60*60 da
+                    self.register_buffer("trace_idx_rot", torch.tensor(trace_idx_rot, dtype=torch.long).to(device=opt.device))# 60*60 db
+                    # self.trace_idx_ori = torch.nn.Parameter(torch.tensor(trace_idx_ori, dtype=torch.long),
+                    #                 requires_grad=False)   # 60*60 da
+
+                    rot_T = self.trace_idx_rot.T
+                    self.rot_k_rot_ik = torch.gather(self.trace_idx_rot, 1, rot_T)  # R_k^-1 R_i^-1 R_k
+                    ### check that the indexing is correct
+                    # R_kinv_iinv_k = torch.einsum('knm,ion,kop->kimp', anchors, anchors, anchors)
+                    # R_kinv_iinv_k_byidx = anchors[self.rot_k_rot_ik]
+                    # assert R_kinv_iinv_k.shape == R_kinv_iinv_k_byidx.shape, "{} {}".format(R_kinv_iinv_k.shape, R_kinv_iinv_k_byidx.shape)
+                    # if not torch.allclose(R_kinv_iinv_k, R_kinv_iinv_k_byidx, 1e-3, 1e-3):
+                    #     print('R_kinv_iinv_k', R_kinv_iinv_k)
+                    #     print('R_kinv_iinv_k_byidx', R_kinv_iinv_k_byidx)
+                    #     print('R_kinv_iinv_k - R_kinv_iinv_k_byidx', R_kinv_iinv_k - R_kinv_iinv_k_byidx)
+                    #     raise ValueError('R_kinv_iinv_k and R_kinv_iinv_k_byidx not identical')
+                    # else:
+                    #     print('R_kinv_iinv_k == R_kinv_iinv_k_byidx')
+
+                    self.trace_idx_rot = torch.gather(self.trace_idx_ori, 1, self.rot_k_rot_ik) # B_ori[k, B_rot[k, B_rot[i,k]]]
+                    self.trace_idx_rot = self.trace_idx_rot.T
+                elif self.gamma > 0:
+                    trace_idx_ori, trace_idx_rot = sgtk.get_relativeV_index()   # 60*12, 60*12
+                    self.register_buffer("trace_idx_ori", torch.tensor(trace_idx_ori, dtype=torch.long).to(device=opt.device))# 60*12 da
+                    self.register_buffer("trace_idx_rot", torch.tensor(trace_idx_rot, dtype=torch.long).to(device=opt.device))# 60*12 db
+
                 self.crossentropyloss = CrossEntropyLoss()
             else:
                 anchors = sgtk.get_anchors(opt.model.kanchor)
-            anchors = torch.tensor(anchors).to(device=opt.device)
+                anchors = torch.tensor(anchors).to(device=opt.device)
 
         # anchors = sgtk.functinoal.get_anchors()
         self.register_buffer('anchors', anchors)
@@ -382,9 +506,6 @@ class TripletBatchLoss(nn.Module):
         self.device = opt.device
         self.loss = opt.train_loss.loss_type
         self.margin = opt.train_loss.margin
-        self.alpha = alpha
-        self.beta = beta    # for permute loss
-        self.sigma = sigma
         self.interpolation = interpolation
         self.k_precision = 1
         
@@ -403,33 +524,73 @@ class TripletBatchLoss(nn.Module):
             # assert hasattr(self, 'attention_params')
             # return self._forward_attention(src, tgt, T, attention_feats)
             return self._forward_equivariance(src, tgt, equi_src, equi_tgt, T)
-        elif self.beta > 0 and equi_src is not None and equi_tgt is not None:
+        elif (self.beta > 0 or self.gamma > 0) and equi_src is not None and equi_tgt is not None:
             return self._forward_att_permute(src, tgt, equi_src, equi_tgt, T)
+        elif self.eta > 0 and equi_src is not None and equi_tgt is not None:
+            return self._forward_att_supervised_by_normal(src, tgt, equi_src, equi_tgt, T)
         else:
             return self._forward_invariance(src, tgt)
 
+    def _forward_att_supervised_by_normal(self, src, tgt, equi_src, equi_tgt, T_label):
+        """equi_src, equi_tgt: br; T_label: 1"""
+        # Pts_src = T * Pts_tgt (rotation-wise) according to match_3dmatch.py
+        inv_loss, acc, fp, cn = self._forward_invariance(src, tgt)
+        inv_info = [inv_loss, acc, fp, cn]
+
+        n_label_src, n_label_tgt = T_label
+        
+        cross_e1, accuracy_1 = self.crossentropyloss(equi_tgt, n_label_tgt)
+        cross_e2, accuracy_2 = self.crossentropyloss(equi_src, n_label_src)
+        cross_e = cross_e1 + cross_e2
+        accuracy = (accuracy_1 + accuracy_2)/2
+        equiv_info = [cross_e, accuracy]
+
+        if self.eta > 0:
+            total_loss = inv_loss + self.eta * cross_e
+        else:
+            raise ValueError('eta should be > 0')
+        return total_loss, inv_info, equiv_info
+
+
     def _forward_att_permute(self, src, tgt, equi_src, equi_tgt, T_label):
         """equi_src, equi_tgt: br; T_label: 1"""
+        # Pts_src = T * Pts_tgt (rotation-wise) according to match_3dmatch.py
         
         inv_loss, acc, fp, cn = self._forward_invariance(src, tgt)
         inv_info = [inv_loss, acc, fp, cn]
 
         if T_label.numel() == 1:
-            trace_idx_ori_batch = self.trace_idx_ori[T_label.item()]    #60
-            equi_tgt_permute = equi_tgt[:, trace_idx_ori_batch]
+            trace_idx_rot_batch = self.trace_idx_rot[T_label.item()]    #60
+            equi_tgt_permute = equi_tgt[:, trace_idx_rot_batch]
         else:
             assert T_label.shape[0] == src.shape[0], "T_label.shape {}, src.shape {}".format(T_label.shape, src.shape)
-            trace_idx_ori_batch = self.trace_idx_ori[T_label, :]   # r(rotation)*r(anchor) -> b(rotation)*r(anchor)
-            equi_tgt_permute = torch.gather(equi_tgt, 1, trace_idx_ori_batch)   # b*r
+            trace_idx_rot_batch = self.trace_idx_rot[T_label, :]   # r(rotation)*r(anchor) -> b(rotation)*r(anchor)
+            equi_tgt_permute = torch.gather(equi_tgt, 1, trace_idx_rot_batch)   # b*r
 
-        # innerp = - (equi_tgt_permute * equi_src).sum(-1).mean(0)
+        # ### set rotations to one of the anchors in match_3dmatch.py, then use this part of code to check equivariance
+        # if not torch.allclose(equi_tgt_permute, equi_src, 1e-3, 1e-3):
+        #     print('equi_src', equi_src)
+        #     print('equi_tgt_permute', equi_tgt_permute)
+        #     print('equi_tgt', equi_tgt)
+        #     print('equi_src - equi_tgt_permute', equi_src - equi_tgt_permute)
+        #     raise ValueError('equi_tgt_permute and equi_src not identical')
+        # else:
+        #     print('equi_src == equi_tgt_permute')
 
-        _, equi_tgt_max_r = equi_tgt_permute.max(dim=1) # b
-        _, equi_src_max_r = equi_src.max(dim=1)         # b
+        if self.use_innerp:
+            equi_tgt_permute = F.normalize(equi_tgt_permute, p=2, dim=1)
+            equi_src = F.normalize(equi_src, p=2, dim=1)
+            cross_e = - (equi_tgt_permute * equi_src).sum(-1).mean(0)
 
-        cross_e1, accuracy = self.crossentropyloss(equi_tgt_permute, equi_src_max_r)
-        cross_e2, _ = self.crossentropyloss(equi_src, equi_tgt_max_r)
-        cross_e = cross_e1 + cross_e2
+            _, equi_src_max_r = equi_src.max(dim=1)         # b
+            _, accuracy = self.crossentropyloss(equi_tgt_permute, equi_src_max_r)
+        else:
+            _, equi_tgt_max_r = equi_tgt_permute.max(dim=1) # b
+            _, equi_src_max_r = equi_src.max(dim=1)         # b
+
+            cross_e1, accuracy = self.crossentropyloss(equi_tgt_permute, equi_src_max_r)
+            cross_e2, _ = self.crossentropyloss(equi_src, equi_tgt_max_r)
+            cross_e = cross_e1 + cross_e2
         
         # accuracy = torch.sum(equi_tgt_max_r == equi_src_max_r).float() / float(equi_tgt_permute.shape[0])
 
@@ -442,8 +603,12 @@ class TripletBatchLoss(nn.Module):
         # print("\n equi_src_max_r.shape", equi_src_max_r.shape)
         # print("\n accuracy", accuracy, "\n")
         equiv_info = [cross_e, accuracy]
-        
-        total_loss = inv_loss + self.beta * cross_e
+        if self.beta > 0:
+            total_loss = inv_loss + self.beta * cross_e
+        elif self.gamma > 0:
+            total_loss = inv_loss + self.gamma * cross_e
+        else:
+            raise ValueError('either beta or gamma should be > 0')
         return total_loss, inv_info, equiv_info
 
     def _forward_invariance(self, src, tgt):

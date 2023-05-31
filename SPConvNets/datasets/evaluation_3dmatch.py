@@ -44,6 +44,8 @@ def read_gt_log(path):
     return np.array(fragment_pairs), np.array(gt_transforms)
 
 def hom_transform(points, T, translation=True):
+    '''out = T * in (when in and out are 3*n). 
+    Actual data are n*3, thus multiplying T.T on the right'''
     if translation:
         points = np.hstack((points, np.ones((points.shape[0], 1))))
         points = points @ T.T

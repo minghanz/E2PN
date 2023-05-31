@@ -87,7 +87,8 @@ class PropagationBlock(nn.Module):
 class S2ConvBlock(nn.Module):
     def __init__(self, dim_in, dim_out, kernel_size, stride,
                  radius, sigma, n_neighbor, multiplier, kanchor=12,
-                 lazy_sample=None, norm=None, activation='relu', pooling='none', dropout_rate=0) -> None:
+                 lazy_sample=None, norm=None, activation='relu', pooling='none', dropout_rate=0,
+                 sym_kernel=True) -> None:
         """S2Convolution, normalization, relu, and dropout"""
         super().__init__()
 
@@ -103,7 +104,7 @@ class S2ConvBlock(nn.Module):
         pooling_method = None if pooling == 'none' else pooling
         self.conv = sptk.S2Conv(dim_in, dim_out, kernel_size, stride,
                                       radius, sigma, n_neighbor, kanchor=kanchor,
-                                      lazy_sample=lazy_sample, pooling=pooling_method)
+                                      lazy_sample=lazy_sample, pooling=pooling_method, sym_kernel=sym_kernel)
         self.norm = nn.InstanceNorm2d(dim_out, affine=False) if norm is None else norm(dim_out)
 
         if activation is None:
@@ -441,7 +442,7 @@ class ClsOutBlockR(nn.Module):
         return x_out, out_feat.squeeze()
 
 class AttRotClass(nn.Module):
-    def __init__(self, dim_feat, dim_anchor, dim_cls, feat_all_anchors) -> None:
+    def __init__(self, dim_feat, dim_anchor, dim_cls, feat_all_anchors, anchor_ab_loss=False, fc_on_concat=False) -> None:
         """Permutation layer for classification task. \n
         Attention of the input feature of all anchors under all rotations (permutations) 
         with the (learned) template feature of all classes in all anchors.
@@ -455,29 +456,53 @@ class AttRotClass(nn.Module):
         self.dim_anchor = dim_anchor
         self.dim_cls = dim_cls
         self.feat_all_anchors = feat_all_anchors
+        self.anchor_ab_loss = anchor_ab_loss
+        self.fc_on_concat = fc_on_concat
 
         W = torch.empty(self.dim_feat, self.dim_anchor, self.dim_cls)   #c,a,n_class
         # nn.init.xavier_normal_(W, gain=0.001)
         nn.init.xavier_normal_(W, gain=nn.init.calculate_gain('relu'))
         self.register_parameter('W', nn.Parameter(W))
+        
+        if self.fc_on_concat:
+            self.fc = nn.Linear(self.dim_feat * self.dim_anchor, self.dim_feat)
 
-    def forward(self, x):
+    def forward(self, x, label=None, x0=None):
         """x: b,c,r,a
         return: [b,n], [b,r,a]"""
         nb = x.shape[0]
         att = torch.einsum("bcra,can->bran", x, self.W) #/ self.dim_feat # bran
         att_rn = torch.sigmoid(att).sum(2) # brn    # attention value for each rotation and class (sum over anchors)
-        att_n, att_n_ridx = att_rn.max(1)   # bn     # max attention value for each class, the rotation index that take the max att value for each class
-        _, att_max_nidx = att_n.max(1)    # b          # the class index that take the max att value
-
-        att_bra = att[torch.arange(nb), :, :, att_max_nidx]    # bra
-        assert att_bra.shape == x[:,0].shape, att_bra.shape
-        att_r_idx = att_n_ridx[torch.arange(nb), att_max_nidx]  # b
-        x_at_r = x[torch.arange(nb), :, att_r_idx, :]       # bca
-        if self.feat_all_anchors:
-            return att_n, att_bra, x_at_r.flatten(1)
+        if label is None:
+            att_n, att_n_ridx = att_rn.max(1)   # bn     # max attention value for each class, the rotation index that take the max att value for each class
+            _, att_max_nidx = att_n.max(1)    # b          # the class index that take the max att value
         else:
-            return att_n, att_bra, x_at_r[...,0]
+            att_n = att_rn[torch.arange(nb), label.flatten(), :]    # bn
+            _, att_max_nidx = att_n.max(1)    # b
+            # att_max_nidx = torch.zeros_like(att_max_nidx) #!!!!!!
+
+        if self.anchor_ab_loss:
+            assert x0 is not None, "anchor_ab_loss requires x before permutation"
+            att_ab = torch.einsum("bca,cdn->badn", x0, self.W)
+            att_ab = att_ab[torch.arange(nb), :, :, att_max_nidx]   # bad
+            att_anchor = att_ab
+        else:
+            att_bra = att[torch.arange(nb), :, :, att_max_nidx]    # bra
+            assert att_bra.shape == x[:,0].shape, att_bra.shape
+            att_anchor = att_bra
+
+        if label is None:
+            att_r_idx = att_n_ridx[torch.arange(nb), att_max_nidx]  # b
+            x_at_r = x[torch.arange(nb), :, att_r_idx, :]       # bca
+        else:
+            x_at_r = x[torch.arange(nb), :, label.flatten(), :]       # bca
+        if self.feat_all_anchors:
+            return att_n, att_anchor, x_at_r.flatten(1)
+        elif self.fc_on_concat:
+            x_at_r = self.fc(x_at_r.flatten(1))
+            return att_n, att_anchor, x_at_r
+        else:
+            return att_n, att_anchor, x_at_r[...,0]
 
 class ClsOutBlockPointnet(nn.Module):
     def __init__(self, params, norm=None, debug=False):
@@ -491,6 +516,9 @@ class ClsOutBlockPointnet(nn.Module):
         k = params['k']
         na = params['kanchor']
         feat_all_anchors = params['feat_all_anchors']
+        anchor_ab_loss = params['anchor_ab_loss']
+        fc_on_concat = params['fc_on_concat']   # the output is only used in retrieval, not trained. 
+        drop_xyz = params['drop_xyz']
 
         self.outDim = k
 
@@ -510,7 +538,7 @@ class ClsOutBlockPointnet(nn.Module):
         #     self.fc1.append(nn.Linear(c_in, c))
         #     # self.norm.append(nn.BatchNorm1d(c))
         #     c_in = c
-        self.pointnet = sptk.PointnetSO3Conv(c_in, c_in, na)
+        self.pointnet = sptk.PointnetSO3Conv(c_in, c_in, na, drop_xyz)
         self.norm.append(nn.BatchNorm1d(c_in))
 
         # ----------------- rotational pooling ---------------------
@@ -524,7 +552,7 @@ class ClsOutBlockPointnet(nn.Module):
             self.temperature = params['temperature']
             self.attention_layer = nn.Conv1d(c_in, 1, 1)
         elif self.pooling_method == 'permutation':
-            self.att_rot_cat_later = AttRotClass(c_in, na, k, feat_all_anchors)
+            self.att_rot_cat_later = AttRotClass(c_in, na, k, feat_all_anchors, anchor_ab_loss, fc_on_concat)
             assert na == 12, na
             trace_idx_ori, trace_idx_rot = sptk.get_relativeV_index()
             self.register_buffer("trace_idx_ori", torch.tensor(trace_idx_ori, dtype=torch.long))
@@ -583,15 +611,16 @@ class ClsOutBlockPointnet(nn.Module):
             x_out = x_out.sum(-1)
         elif self.pooling_method == 'permutation':
             x_out_permute = x_out[:,:, self.trace_idx_ori]  # b,c,r,a
-            x_out, out_feat, x_feat = self.att_rot_cat_later(x_out_permute) # [b,c_out], [b,r,a]
+            x_out, out_feat, x_feat = self.att_rot_cat_later(x_out_permute, label, x0=x_out) # [b,c_out], [b,r,a]
             return x_out, out_feat, x_feat
         else:
             raise NotImplementedError(f"Pooling mode {self.pooling_method} is not implemented!")
 
+        x_feat = x_out
         x_out = self.fc2(x_out) # b,c_out
 
         ### category prediction, rotation classs prediction, features for retrieval. 
-        return x_out, out_feat.squeeze(), out_feat.squeeze()
+        return x_out, out_feat.squeeze(), x_feat
 
 class InvOutBlockR(nn.Module):
     def __init__(self, params, norm=None):
@@ -725,9 +754,11 @@ class InvOutBlockMVD(nn.Module):
         c_out = mlp[-1]
         na = params['kanchor']
 
+        self.p_pool_to_cout = params['p_pool_to_cout']
         self.p_pool_first = params['p_pool_first']
         # self.permute = params['permute']
         self.permute_nl = params['permute_nl']
+        self.permute_soft = params['permute_soft']
 
         # Attention layer
         self.temperature = params['temperature']
@@ -739,16 +770,26 @@ class InvOutBlockMVD(nn.Module):
 
         if self.pooling_method == 'attention':
             if self.p_pool_first:
-                self.attention_layer = nn.Sequential(nn.Conv1d(c_in, c_in, 1), \
+                if self.p_pool_to_cout:
+                    self.pointnet = sptk.PointnetSO3Conv(c_in,c_out,na)
+                    self.attention_layer = nn.Sequential(nn.Conv1d(c_out, c_out, 1), \
+                                                        nn.ReLU(inplace=True), \
+                                                        nn.Conv1d(c_out,1,1))
+                else:
+                    self.pointnet = sptk.PointnetSO3Conv(c_in,c_in,na)
+                    self.attention_layer = nn.Sequential(nn.Conv1d(c_in, c_in, 1), \
                                                         nn.ReLU(inplace=True), \
                                                         nn.Conv1d(c_in,1,1))
-                self.pointnet = sptk.PointnetSO3Conv(c_in,c_in,na)
-                self.out_layer = nn.Linear(c_in, c_out)
+                    self.out_layer = nn.Linear(c_in, c_out)
             else:
                 self.attention_layer = nn.Sequential(nn.Conv2d(c_in, c_in, 1), \
                                                         nn.ReLU(inplace=True), \
                                                         nn.Conv2d(c_in,c_in,1))
-                self.pointnet = sptk.PointnetSO3Conv(c_in,c_out,na)
+                if na != 1:
+                    self.attention_layer2 = nn.Sequential(nn.Conv1d(c_in, c_in, 1), \
+                                                            nn.ReLU(inplace=True), \
+                                                            nn.Conv1d(c_in,1,1))
+                self.pointnet = sptk.PointnetSO3Conv(c_in,c_out,1)
                 
         elif self.pooling_method == 'permutation':
             self.pointnet = sptk.PointnetSO3Conv(c_in,c_in,na)
@@ -779,10 +820,14 @@ class InvOutBlockMVD(nn.Module):
         x_feat = x_feat[:,:,self.trace_idx_ori].flatten(1,2) #   b[ca]r
 
         x_attn = self.attention_layer(x_feat).squeeze(1) # br
-        x_attn = F.normalize(x_attn, dim=1)
-        _, max_r_idx = torch.max(x_attn, dim=1)    # b
+        if self.permute_soft:
+            attn_sfm = F.softmax(x_attn, dim=1)           # br
+            x_feat_max_r = (x_feat * attn_sfm.unsqueeze(1)).sum(-1) # b[ca]
+        else:
+            # x_attn = F.normalize(x_attn, dim=1)     # should not be normalized, commented out 11/8/22
+            _, max_r_idx = torch.max(x_attn, dim=1)    # b
+            x_feat_max_r = x_feat[torch.arange(nb), :, max_r_idx]   # b[ca]
 
-        x_feat_max_r = x_feat[torch.arange(nb), :, max_r_idx]   # b[ca]
         x_out = self.out_layer(x_feat_max_r)        # b c_out
 
         return x_out, x_attn
@@ -792,15 +837,20 @@ class InvOutBlockMVD(nn.Module):
 
         nb, nc, np, na = x.feats.shape
         
-        x_feat = self._pooling(x)   # bcpa -> bca
+        if self.p_pool_to_cout:
+            x_feat = self.pointnet(x)   # bcpa -> b c_out a
+        else:
+            x_feat = self._pooling(x)   # bcpa -> bca
 
         attn = self.attention_layer(x_feat)     # bca -> b1a
-        attn = F.softmax(attn, dim=2)           # b1a
-        x_out = (x_feat * attn).sum(-1)         # bca, b1a -> bc
+        attn_sfm = F.softmax(attn, dim=2)           # b1a
+        attn = attn.squeeze(1)                      # ba, unnormalized
+        x_out = (x_feat * attn_sfm).sum(-1)         # bca, b1a -> bc
 
-        x_out = self.out_layer(x_out)           # b, c -> b c_out
+        if not self.p_pool_to_cout:
+            x_out = self.out_layer(x_out)           # b, c -> b c_out
 
-        return F.normalize(x_out, p=2, dim=1), None
+        return F.normalize(x_out, p=2, dim=1), attn
 
     def forward(self, x):
         if self.pooling_method == 'attention':
@@ -821,17 +871,29 @@ class InvOutBlockMVD(nn.Module):
         # attention first
         nb, nc, np, na = x.feats.shape
 
-        attn = self.attention_layer(x.feats)
-        attn = F.softmax(attn, dim=3)           # nb,nc,np,na
+        if na == 1:
+            attn = self.attention_layer(x.feats)
+            attn = F.softmax(attn, dim=3)           # nb,nc,np,na
+            attn_final = attn
 
-        # nb, nc, np, 1
-        x_out = (x.feats * attn).sum(-1, keepdim=True)
+            # nb, nc, np, 1
+            x_out = (x.feats * attn).sum(-1, keepdim=True)
+        else:
+            attn = self.attention_layer(x.feats)
+            attn_sfm = F.softmax(attn, dim=3)           # nb,nc,np,na
+
+            attn_pool = torch.max(attn,2)[0]    # bca
+            attn_final = self.attention_layer2(attn_pool) # b1a
+            attn_final = attn_final.squeeze(1)  # ba
+
+            # nb, nc, np, 1
+            x_out = (x.feats * attn_sfm).sum(-1, keepdim=True)
         x_in = zptk.SphericalPointCloud(x.xyz, x_out, None)
 
         # nb, nc
         x_out = self.pointnet(x_in).view(nb, -1)
 
-        return F.normalize(x_out, p=2, dim=1), attn
+        return F.normalize(x_out, p=2, dim=1), attn_final
 
     def _pooling(self, x):
         # [nb, nc, na]
@@ -892,6 +954,10 @@ class RelSO3OutBlockR(nn.Module):
         c_in = params['dim_in']
         mlp = params['mlp']
         na = params['kanchor']
+        self.rot_ref_tgt = params['rot_ref_tgt']
+        self.topk = params['topk']
+
+        self.check_equiv = params['check_equiv']
 
         if 'pooling' not in params.keys():
             self.pooling_method = 'attention'
@@ -912,7 +978,10 @@ class RelSO3OutBlockR(nn.Module):
             
 
         self.pointnet = sptk.PointnetSO3Conv(c_in, c_in, na)
-        c_in = c_in * 2
+        if self.pooling_method == 'permutation':
+            c_in = c_in * 3
+        else:
+            c_in = c_in * 2
 
         self.linear = nn.ModuleList()
 
@@ -933,6 +1002,12 @@ class RelSO3OutBlockR(nn.Module):
             self.regressor_layer = nn.Conv2d(mlp[-1],self.out_channel,(1,1))
         elif self.pooling_method == 'permutation':
             self.regressor_layer = nn.Conv2d(mlp[-1]*na,self.out_channel,(1,1))
+            self.regressor_layer_mid = nn.Conv2d(mlp[-1]*na,self.out_channel,(1,1))
+            # self.regressor_layer = nn.Sequential(
+            #     nn.Conv2d(mlp[-1]*na,mlp[-1]*5,(1,1)),
+            #     nn.ReLU(),
+            #     nn.Conv2d(mlp[-1]*5,self.out_channel,(1,1)),
+            # )   # tmp!!!!
         else:
             raise ValueError("self.pooling_method {} not recognized".format(self.pooling_method))
 
@@ -952,15 +1027,15 @@ class RelSO3OutBlockR(nn.Module):
         f2 = self._pooling(sp2)
 
         if self.pooling_method == 'attention':
-            confidence, y = self.forward_single(f1, f2)
+            return self.forward_single(f1, f2)
         elif self.pooling_method == 'permutation':
-            confidence, y = self.forward_concat(f1, f2)
+            return self.forward_concat(f1, f2)
         else:
             raise ValueError("self.pooling_method {} not recognized".format(self.pooling_method))
 
 
         # return: [nb, na, na], [nb, n_out, na, na]
-        return confidence, y
+        # return confidence, y
 
     def forward_concat(self, f1, f2):
         """f1, f2: nb,nc,na
@@ -968,10 +1043,17 @@ class RelSO3OutBlockR(nn.Module):
         nb = f1.shape[0]
         na = f1.shape[2]
 
-        f2_permute = f2[:,:,self.trace_idx_rot]     # b,c,r,a
-        # innerp = torch.einsum("bcra,bca->br", f2_permute, f1)
+        if self.rot_ref_tgt:
+            f1_permute = f1[:,:,self.trace_idx_ori]
+            # x_out = torch.cat([f1_permute, f2.unsqueeze(2).expand_as(f1_permute)], 1)  # b, c*2, r, a
+            # x_out = f1_permute - f2.unsqueeze(2)  # b, c, r, a # tmp!!!!
+            x_out = torch.cat([f1.unsqueeze(2).expand_as(f1_permute), f1_permute, f2.unsqueeze(2).expand_as(f1_permute)], 1)  # b, c*2, r, a
+        else:
+            f2_permute = f2[:,:,self.trace_idx_rot]     # b,c,r,a
+            # innerp = torch.einsum("bcra,bca->br", f2_permute, f1)
 
-        x_out = torch.cat([f2_permute, f1.unsqueeze(2).expand_as(f2_permute)], 1)  # b, c*2, r, a
+            # x_out = torch.cat([f2_permute, f1.unsqueeze(2).expand_as(f2_permute)], 1)  # b, c*2, r, a # tmp!!!!
+            x_out = torch.cat([f1.unsqueeze(2).expand_as(f2_permute), f2_permute, f2.unsqueeze(2).expand_as(f2_permute)], 1)  # b, c*2, r, a
 
         # fc layers with relu
         for linear in self.linear:
@@ -982,15 +1064,42 @@ class RelSO3OutBlockR(nn.Module):
 
         confidence = torch.sigmoid(attention_wts)
         confidence_r = confidence.sum(-1)   # b, r
-        max_conf, max_r = torch.max(confidence_r, 1, keepdim=True)  # b, 1
+        if self.topk == 1:
+            max_conf, max_r = torch.max(confidence_r, 1, keepdim=True)  # b, 1
 
-        max_r = max_r[:,None,:,None].expand(-1, x_out.shape[1], -1, na)     # b, c, 1, a
-        x_out_max_r = torch.gather(x_out, 2, max_r).squeeze(2)  # b, c, a
-        x_out_max_r = x_out_max_r.reshape(nb, -1, 1, 1)
-        y = self.regressor_layer(x_out_max_r).reshape(nb, -1)   # b, c_out
+            max_r = max_r[:,None,:,None].expand(-1, x_out.shape[1], -1, na)     # b, c, 1, a
+            x_out_max_r = torch.gather(x_out, 2, max_r).squeeze(2)  # b, c, a
+            x_out_max_r = x_out_max_r.reshape(nb, -1, 1, 1)
+            y = self.regressor_layer(x_out_max_r).reshape(nb, -1)   # b, c_out
+        else:
+            # confidence_softmax = F.softmax(confidence_r)
+            top_conf, top_idx = torch.topk(confidence_r, self.topk, 1)    # b, topk
+            top_idx = top_idx[:,None,:,None].expand(nb, x_out.shape[1], self.topk, na)   # b, c, topk, a
+            x_out_top_conf = torch.gather(x_out, 2, top_idx)    # b, c, topk, a
+            x_out_top_conf = x_out_top_conf.transpose(2,3).reshape(nb, -1, self.topk, 1)  # b, (c, a), topk
+            y = self.regressor_layer_mid(x_out_top_conf)   # b, cout, topk, 1
+            y = y.transpose(1,2).reshape(nb, self.topk, self.out_channel)   # b, topk, cout
+            y_top = self.regressor_layer(x_out_top_conf[:,:,[0]]).reshape(nb, self.out_channel).unsqueeze(1)   # b, 1, cout
+            y = torch.cat([y, y_top], 1)    # b, (topk+1), cout
+
+            # top_mask = top_conf > 0.1
+            # top_mask_row = top_mask.sum(1, keepdim=True).expand_as(top_mask)
+            # top_mask_max = torch.ones_like(top_mask)
+            # # top_mask_max[:,0] = True
+            # top_mask_final = torch.where(top_mask_row, top_mask, top_mask_max)
+            # top_conf = torch.where(top_mask_final, top_conf, torch.zeros_like(top_conf))
+            # top_conf = F.normalize(top_conf, p=1, dim=1)
+
+            # top_conf = top_conf[:,None,:].expand(-1, self.out_channel, -1)   # b, cout, topk
+            # y = (ys * top_conf).sum(2)
+
 
         # return: binary classification logits [b,r,a], residual rotation [b, c_out]
-        return attention_wts, y
+        # return attention_wts, y
+        if self.check_equiv:
+            return attention_wts, y, f1_permute, f1, f2
+        else:
+            return attention_wts, y
 
     def forward_single(self, f1, f2):
         # return: [nb, na, na], [nb, n_out, na, na]

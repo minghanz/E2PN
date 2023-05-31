@@ -389,6 +389,7 @@ def icosahedron_trimesh_to_vertices(mesh_path):
     mesh = trimesh.load(mesh_path)  # trimesh 3.9 does not work. need 3.2
     mesh.fix_normals()
     vs = mesh.vertices  # each vertex is of norm 1
+    vs = np.array(vs)
 
     # the 5 rotation matrices for each of the 12 vertices
     Rs = get_so3_from_anchors_np_zyz(vs, gsize=5)
@@ -751,13 +752,24 @@ def label_relative_rotation_np(anchors, T):
     R_target = T_from_anchors[idxs[:,0], idxs[:,1]]
     return R_target, label
 
-def label_relative_rotation_simple(anchors, T):
+def label_relative_rotation_simple(anchors, T, rot_ref_tgt=False):
     """Find the anchor rotation that is closest to the queried rotation. 
     return: 
     R_target: [3,3], T = R_target * anchors[label]
     label: int"""
-    T_then_anchors = np.einsum('ij,akj->aik', T, anchors)
+    if rot_ref_tgt:
+        # anchors.T * T = R_target -> T = anchors * R_target
+        T_then_anchors = np.einsum('aji,jk->aik', anchors, T)
+    else:
+        # T * anchors.T = R_target -> T = R_target * anchors
+        T_then_anchors = np.einsum('ij,akj->aik', T, anchors)
     label = np.argmax(np.einsum('aii->a', T_then_anchors),axis=0)
     R_target = T_then_anchors[label.item()]
     # return: [3,3], int
     return R_target, label
+
+def label_normal_simple(anchors_v, ns):
+    """anchors_v: 12*3, n: m*3"""
+    innp = np.einsum('ai,mi->am', anchors_v, ns)
+    label = np.argmax(innp, 0)  # m
+    return label

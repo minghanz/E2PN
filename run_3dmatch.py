@@ -19,7 +19,7 @@ SCENE_TO_TEST = [
 def config_opt_3dmatch(opt):
     opt.model.search_radius = 0.4
     opt.model.model = "inv_so3net_pn"
-    opt.no_augmentation = True
+    # opt.no_augmentation = True
 
     if opt.mode == 'train':
         opt.batch_size = 1

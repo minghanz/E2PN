@@ -11,7 +11,9 @@ from sklearn.neighbors import NearestNeighbors as nnbrs
 from multiprocessing import Pool
 import vgtk.so3conv.functional as L
 import vgtk.pc as pctk
-from vgtk.functional import RigidMatrix, label_relative_rotation_simple
+from vgtk.functional import RigidMatrix, label_relative_rotation_simple, label_normal_simple
+import matplotlib.pyplot as plt
+import trimesh
 
 # ------------------------ utilities for 3DMatch Data ---------------------------
 
@@ -104,7 +106,8 @@ from collections import namedtuple
 from scipy.spatial import KDTree
 Kptmeta = namedtuple('Kptmeta','indices, id, pathA, pathB, poseA, poseB')
 
-def radius_ball_search_o3d(pcd, kpt, search_radius, voxel_size=0.015, return_normals=False, input_num=None, name=None):
+def radius_ball_search_o3d(pcd, kpt, search_radius, voxel_size=0.015, return_normals=False, input_num=None, name=None, trans_by_normals=True):
+    '''return: all_pc: all patches, pcd_down: voxel-downsampled full point cloud, normals_at_kpt: as named '''
     # radius-ball search
 
     normals_at_kpt = None
@@ -119,21 +122,26 @@ def radius_ball_search_o3d(pcd, kpt, search_radius, voxel_size=0.015, return_nor
                 raise RuntimeError('[!] The point cloud needs normals.')
         normals_at_kpt = np.asarray(pcd.normals)[kpt]
 
+    ### search for points around keypoints
+    ### keypoints are from raw points (pcd). The neighboring points are from downsampled points (pc). 
     search = KDTree(pc)
     results = search.query_ball_point(keypoints, search_radius)
     all_pc = []
     for indices in results:
         # print(len(indices))
         if len(indices) <= 1:
+            ### no neighboring points found. pad all zeros. 
             i = 1024 if input_num is None else input_num
             all_pc.append(np.zeros([i,3],dtype=np.float32))
         else:
+            ### if num of pts per patch is given, do resampling among the neighboring points
             if input_num is not None:
                 resample_indices, patch = pctk.uniform_resample_np(pc[indices], input_num)
+            ### otherwise, all neighboring points form the patch
             else:
                 patch = pc[indices]
             all_pc.append(patch)
-    if return_normals:
+    if return_normals and trans_by_normals:
         all_pc = transform_with_normals(all_pc, normals_at_kpt)
 
     return all_pc, pcd_down, normals_at_kpt
@@ -231,12 +239,13 @@ class PointCloudPairSampler(data.Sampler):
 
 
 class FragmentLoader(data.Dataset):
-    def __init__(self, opt, search_radius, npt=24, kptname='kpts', use_normals=False):
+    def __init__(self, opt, search_radius, npt=24, kptname='kpts', use_normals=False, normal_for_sup=False):
         super(FragmentLoader, self).__init__()
         self.opt = opt
         self.data_path = os.path.join(opt.dataset_path, 'fused_fragments')
 
         self.use_normals = use_normals
+        self.normal_for_sup = normal_for_sup
 
         scene_selection = None
         # scene_selection = ['sun3d-mit_lab_hj-lab_hj_tea_nov_2_2012_scan1_erika']
@@ -296,6 +305,10 @@ class FragmentLoader(data.Dataset):
 
         if self.opt.model.kanchor == 12:
             self.anchors = L.get_anchorsV()
+            self.anchors_v, _, _, _, _ = L.get_icosahedron_vertices()   # 12, 3
+            assert isinstance(self.anchors, np.ndarray), "type(self.anchors): {}".format(type(self.anchors))
+            assert isinstance(self.anchors_v, np.ndarray), "type(self.anchors_v): {}".format(type(self.anchors_v))
+            # make sure they are not trimesh.caching.TrackedArray
         else:
             self.anchors = L.get_anchors(self.opt.model.kanchor)
             
@@ -309,8 +322,8 @@ class FragmentLoader(data.Dataset):
         kpts = meta.indices[choice].astype(np.int32)
         pcdA = o3d.io.read_point_cloud(meta.pathA)
         pcdB = o3d.io.read_point_cloud(meta.pathB)
-        rawA, pcdA_down, normalA = radius_ball_search_o3d(pcdA, kpts[:,0], self.search_radius, self.voxel_size, self.use_normals)
-        rawB, pcdB_down, normalB = radius_ball_search_o3d(pcdB, kpts[:,1], self.search_radius, self.voxel_size, self.use_normals)
+        rawA, pcdA_down, normalA = radius_ball_search_o3d(pcdA, kpts[:,0], self.search_radius, self.voxel_size, self.use_normals, trans_by_normals=not self.normal_for_sup)
+        rawB, pcdB_down, normalB = radius_ball_search_o3d(pcdB, kpts[:,1], self.search_radius, self.voxel_size, self.use_normals, trans_by_normals=not self.normal_for_sup)
 
         pcdA = np.asarray(pcdA.points).astype(np.float32)
         pcdB = np.asarray(pcdB.points).astype(np.float32)
@@ -320,15 +333,35 @@ class FragmentLoader(data.Dataset):
         inputB = []
 
         # preprocessing and augmentation
+        # Pts_A = T * Pts_B (rotation-wise)
         T = RigidMatrix(meta.poseA).R.T @ RigidMatrix(meta.poseB).R
+        T_noaug = T
+        normalA_noaug = normalA
+        normalB_noaug = normalB
+        pcdA_noaug = pcdA
+        pcdB_noaug = pcdB
 
         self.R_aug_src = None
         self.R_aug_tgt = None        
         if not self.opt.no_augmentation:
-            _, self.R_aug_src = pctk.rotate_point_cloud(None, max_degree=30)
-            _, self.R_aug_tgt = pctk.rotate_point_cloud(None, max_degree=30)
-            _, pcdA = pctk.rotate_point_cloud(pcdA, self.R_aug_src)
-            _, pcdB = pctk.rotate_point_cloud(pcdB, self.R_aug_tgt)
+            _, self.R_aug_src = pctk.rotate_point_cloud(None, max_degree=180)    # 30 in original code
+            _, self.R_aug_tgt = pctk.rotate_point_cloud(None, max_degree=180)
+            ### Pts_A' = R_aug_src * Pts_A
+            ### Pts_B' = R_aug_tgt * Pts_B
+            ### Pts_A = T * Pts_B
+            ### => Pts_A' = R_aug_src * T * R_aug_tgt.T * Pts_B'
+            T = self.R_aug_src @ T @ self.R_aug_tgt.T
+            T_aug = T
+            pcdA, _ = pctk.rotate_point_cloud(pcdA, self.R_aug_src)
+            pcdB, _ = pctk.rotate_point_cloud(pcdB, self.R_aug_tgt)
+            pcdA_aug = pcdA
+            pcdB_aug = pcdB
+
+            if self.use_normals and self.normal_for_sup:
+                normalA, _ = pctk.rotate_point_cloud(normalA, self.R_aug_src)
+                normalB, _ = pctk.rotate_point_cloud(normalB, self.R_aug_tgt)
+                normalA_aug = normalA
+                normalB_aug = normalB
 
         for pca, pcb in zip(rawA, rawB):
             inputA.append(self._preprocess(pca, self.R_aug_src))
@@ -337,18 +370,146 @@ class FragmentLoader(data.Dataset):
         inputA = np.array(inputA)
         inputB = np.array(inputB)
         
-        R, R_label = label_relative_rotation_simple(self.anchors, T)
+        if not self.opt.no_augmentation:
+            inputA_aug = inputA
+            inputB_aug = inputB
+            inputA_noaug = []
+            inputB_noaug = []
+            for pca, pcb in zip(rawA, rawB):
+                inputA_noaug.append(self._preprocess(pca, None))
+                inputB_noaug.append(self._preprocess(pcb, None))
+            inputA_noaug = np.array(inputA_noaug)
+            inputB_noaug = np.array(inputB_noaug)
+        else:
+            inputA_noaug = inputA
+            inputB_noaug = inputB
 
-        data = {'src': torch.from_numpy(inputA.astype(np.float32)),\
-                'tgt': torch.from_numpy(inputB.astype(np.float32)),\
-                'frag_src': pcdA,\
-                'frag_tgt': pcdB,\
-                'T': torch.from_numpy(T.astype(np.float32)),\
-                'T_label': torch.from_numpy(np.array([R_label])).long(),    
+        
+        # if not self.opt.no_augmentation:
+        #     ### We can use two copies of patches only different by a rotation to verify the equivariant relationship
+        #     R, R_label = label_relative_rotation_simple(self.anchors, T)
+        #     T = self.anchors[R_label]
+        #     T_grid = T
+
+        #     inputB = np.array([rawAi @ T for rawAi in inputA])
+        #     pcdB = pcdA @ T
+        #     if self.use_normals and self.normal_for_sup:
+        #         normalB = normalA @ T
+        #         normalB_grid = normalB
+        #         normalA_grid = normalA
+
+        #     inputB_grid = inputB
+        #     pcdB_grid = pcdB
+        #     inputA_grid = inputA
+        #     pcdA_grid = pcdA
+
+        R_res, R_label = label_relative_rotation_simple(self.anchors, T)
+        R_grid = self.anchors[R_label]
+        if self.use_normals and self.normal_for_sup:
+            normal_label_A = label_normal_simple(self.anchors_v, normalA)
+            normal_label_B = label_normal_simple(self.anchors_v, normalB)
+
+        ### visualizing the augmentation
+        # fig = plt.figure()
+        # ax = fig.add_subplot(projection='3d')
+        # ax.scatter(inputB_noaug[0][:,0], inputB_noaug[0][:,1], inputB_noaug[0][:,2], 'r', s=0.1)
+        # ax.scatter(inputA_noaug[0][:,0], inputA_noaug[0][:,1], inputA_noaug[0][:,2], 'g', s=0.1)
+        # plt.title(','.join(['%.2f'%t for t in T_noaug.reshape(-1)]))
+        # plt.savefig('%d_0.png'%index)
+
+        # fig = plt.figure()
+        # ax = fig.add_subplot(projection='3d')
+        # ax.scatter(inputB_aug[0][:,0], inputB_aug[0][:,1], inputB_aug[0][:,2], 'r', s=0.1)
+        # ax.scatter(inputA_aug[0][:,0], inputA_aug[0][:,1], inputA_aug[0][:,2], 'g', s=0.1)
+        # plt.title(','.join(['%.2f'%t for t in T_aug.reshape(-1)]))
+        # plt.savefig('%d_1.png'%index)
+
+        # fig = plt.figure()
+        # ax = fig.add_subplot(projection='3d')
+        # ax.scatter(inputB_grid[0][:,0], inputB_grid[0][:,1], inputB_grid[0][:,2], 'r', s=0.1)
+        # ax.scatter(inputA_grid[0][:,0], inputA_grid[0][:,1], inputA_grid[0][:,2], 'b', s=0.1)
+        # plt.title(','.join(['%.2f'%t for t in T_grid.reshape(-1)]))
+        # plt.savefig('%d_2.png'%index)
+
+        # ### visualizing and checking the alignment
+        # fig = plt.figure()
+        # ax = fig.add_subplot(projection='3d')
+        # ax.scatter(inputB[0][:,0], inputB[0][:,1], inputB[0][:,2], 'r', s=0.1)
+        # ax.scatter(inputA[0][:,0], inputA[0][:,1], inputA[0][:,2], 'b', s=0.1)
+        # plt.title('full: '+','.join(['%.2f'%t for t in T.reshape(-1)]))
+        # plt.savefig('%d_before.png'%index)
+
+        # patchA = inputA[0]
+        # patchB = inputB[0]
+        # patchA = patchA @ R_grid # R_grid  # PA = T * PB
+        # if self.use_normals and self.normal_for_sup:
+        #     normal_patchA = normalA[0]
+        #     normal_patchB = normalB[0]
+        #     normal_patchA = R_grid.T @ normal_patchA    # R.T*n
+        # ctrA = patchA.mean(0)     # 3
+        # ctrB = patchB.mean(0)      # 3
+
+        # fig = plt.figure()
+        # ax = fig.add_subplot(projection='3d')
+        # ax.scatter(patchB[:,0], patchB[:,1], patchB[:,2], 'r', s=0.1)
+        # ax.scatter(patchA[:,0], patchA[:,1], patchA[:,2], 'b', s=0.1)
+        # plt.title('grid: %d. '%R_label + ','.join(['%.2f'%t for t in R_grid.reshape(-1)]))
+        
+        # if self.use_normals and self.normal_for_sup:
+        #     ### In the below figure, one can see that the two normal vectors are not necessary identical, but mostly close
+        #     scale_A = np.linalg.norm(patchA.max(0) - patchA.min(0), 2) / 2
+        #     scale_B = np.linalg.norm(patchB.max(0) - patchB.min(0), 2) / 2
+        #     normal_patchA = normal_patchA * scale_A
+        #     normal_patchB = normal_patchB * scale_B
+            
+        #     ax.plot([ctrA[0] ,ctrA[0] + normal_patchA[0]],[ctrA[1], ctrA[1] + normal_patchA[1]],[ctrA[2], ctrA[2] + normal_patchA[2]])
+        #     ax.plot([ctrB[0] ,ctrB[0] + normal_patchB[0]],[ctrB[1], ctrB[1] + normal_patchB[1]],[ctrB[2], ctrB[2] + normal_patchB[2]])
+        
+        # plt.savefig('%d_align_by_grid.png'%index)
+
+        # patchA = inputA[0]
+        # patchB = inputB[0]
+        # patchA = patchA @ T # R_grid  # PA = T * PB
+        # if self.use_normals and self.normal_for_sup:
+        #     normal_patchA = normalA[0]
+        #     normal_patchB = normalB[0]
+        #     normal_patchA = T.T @ normal_patchA    # R.T*n
+        # ctrA = patchA.mean(0)     # 3
+        # ctrB = patchB.mean(0)      # 3
+
+        # fig = plt.figure()
+        # ax = fig.add_subplot(projection='3d')
+        # ax.scatter(patchB[:,0], patchB[:,1], patchB[:,2], 'r', s=0.1)
+        # ax.scatter(patchA[:,0], patchA[:,1], patchA[:,2], 'b', s=0.1)
+        # plt.title('res: '+'%d. '%R_label + ','.join(['%.2f'%t for t in R_res.reshape(-1)]))
+        
+        # if self.use_normals and self.normal_for_sup:
+        #     ### In the below figure, one can see that the two normal vectors are not necessary identical, but mostly close
+        #     scale_A = np.linalg.norm(patchA.max(0) - patchA.min(0), 2) / 2
+        #     scale_B = np.linalg.norm(patchB.max(0) - patchB.min(0), 2) / 2
+        #     normal_patchA = normal_patchA * scale_A
+        #     normal_patchB = normal_patchB * scale_B
+            
+        #     ax.plot([ctrA[0] ,ctrA[0] + normal_patchA[0]],[ctrA[1], ctrA[1] + normal_patchA[1]],[ctrA[2], ctrA[2] + normal_patchA[2]])
+        #     ax.plot([ctrB[0] ,ctrB[0] + normal_patchB[0]],[ctrB[1], ctrB[1] + normal_patchB[1]],[ctrB[2], ctrB[2] + normal_patchB[2]])
+        
+        # plt.savefig('%d_align_by_full.png'%index)
+
+
+        data = {'src': torch.from_numpy(inputA.astype(np.float32)), # patches
+                'tgt': torch.from_numpy(inputB.astype(np.float32)), # patches
+                'frag_src': pcdA, # raw point cloud (not downsampled or patch-selected around keypoints)
+                'frag_tgt': pcdB, # raw point cloud (not downsampled or patch-selected around keypoints)
+                'T': torch.from_numpy(T.astype(np.float32)),
+                'T_label': torch.from_numpy(np.array([R_label])).long(),     
                 'fn': meta.id}
+        if self.use_normals and self.normal_for_sup:
+            data['normal_label_src'] = torch.from_numpy(np.array(normal_label_A)).long()
+            data['normal_label_tgt'] = torch.from_numpy(np.array(normal_label_B)).long()
         return data
 
     def _preprocess(self, pc, R_aug=None, n=None):
+        '''subsample and optionally rotate (on normals as well if given)'''
         idx, pc = pctk.uniform_resample_np(pc, self.input_num)
         if n is not None:
             n = n[idx]
@@ -451,7 +612,7 @@ class SceneEvalLoader(data.Dataset):
         self.search_radius = opt.model.search_radius # search_radius
         self.input_num = opt.model.input_num
         self.voxel_size = 0.03 if self.input_num < 1024 else 0.015
-        self.use_normals = self.opt.model.normals
+        self.use_normals = self.opt.model.normals and not self.opt.model.normal_for_sup
 
         # paths to data files
         self.kptsfiles = glob.glob(os.path.join(self.data_path,'01_Keypoints','cloud_bin_*Keypoints.txt'))

@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 import vgtk
+from torch.utils.tensorboard import SummaryWriter
 
 
 # TODO add dataparallel
@@ -54,6 +55,9 @@ class Trainer():
         os.makedirs(self.ckpt_dir, exist_ok=True)
         self.logger.log('Setup', f'Checkpoint dir created!')
 
+        # self.writer = SummaryWriter(self.root_dir)
+        # self.logger.log("Setup", "SummaryWriter initialized!")
+
         # build dataset
         self._setup_datasets()
 
@@ -94,6 +98,8 @@ class Trainer():
 
     def train_iter(self):
         for i in range(self.opt.num_iterations+1):
+            # if i == 5:
+            #     break
             self.timer.set_point('train_iter')
             self.lr_schedule.step()
             self.step()
@@ -131,7 +137,7 @@ class Trainer():
     # TODO: check that the options have the required key collection
     def check_opt(self, opt, print_opt=True):
         self.opt = opt
-        self.opt.device = torch.device('cuda')
+        self.opt.device = torch.device('cuda') # torch.device('cuda') 'cpu'
 
     def _print_running_stats(self, step):
         stats = self.summary.get()
@@ -198,12 +204,17 @@ class Trainer():
 
         state_dicts = torch.load(resume_path)
 
+        training_flag = self.model.training
+        self.model.eval()
         # self.model = nn.DataParallel(self.model)
         self.model.load_state_dict(state_dicts)
         # self.model = self.model.module
         # self.optimizer.load_state_dict(state_dicts['optimizer'])
         # self.start_epoch = state_dicts['epoch']
         # self.start_iter = state_dicts['iter']
+
+        if training_flag:
+            self.model.train()
         self.logger.log('Setup', f'Resume finished! Great!')
 
 
@@ -217,13 +228,19 @@ class Trainer():
         else:
             save_path = f'{path}.pth'
             
+        training_flag = self.model.training
+        self.model.eval()
         if self._use_multi_gpu:
-            params = self.model.module.cpu().state_dict()
+            # params = self.model.module.cpu().state_dict()
+            params = self.model.module.state_dict()
         else:
-            params = self.model.cpu().state_dict()
+            # params = self.model.cpu().state_dict()
+            params = self.model.state_dict()
         torch.save(params, save_path)
+        if training_flag:
+            self.model.train()
 
-        if torch.cuda.is_available():
-            # torch.cuda.device(gpu_id)
-            self.model.to(self.opt.device)
+        # if torch.cuda.is_available():
+        #     # torch.cuda.device(gpu_id)
+        #     self.model.to(self.opt.device)
         self.logger.log('Training', f'Checkpoint saved to: {save_path}!')

@@ -20,11 +20,12 @@ E2PN is a SE(3)-equivariant network architecture designed for deep point cloud a
 
 
 ## Usage
+We use the same dependencies as the [EPN](https://github.com/nintendops/EPN_PointCloud) repository. 
 
-The code has been tested on Python3.7, PyTorch 1.7.1 and CUDA (10.1). The module and additional dependencies can be set up with 
+The code has been tested on Python 3.7.12, PyTorch 1.11.0 and CUDA 11.3.1. The module and additional dependencies can be set up with 
 ```
 cd vgtk
-python setup.py build_ext
+python setup.py build_ext --inplace
 ```
 
 ## Experiments
@@ -39,75 +40,103 @@ The original 3DMatch training and evaluation dataset can be found [here](https:/
 
 Pretrained model can be downloaded using this [link](https://drive.google.com/file/d/1vy9FRGWQsuVi4nf--YIqg_8yHFiWWJhh/view?usp=sharing) -->
 
+### ModelNet40 Classification
+
 **Training**
 
-The following lines can be used for the training of each experiment
+The following lines can be used for the training of each model. In all experiments, `PATH_TO_LOG`, `PATH_TO_MODELNET40`, and `PATH_TO_3DMATCH_TRAIN` are constant and no need to change across experiments. 
 
-***E2PN mode***
 ```
-# modelnet classification
-python run_modelnet.py experiment --experiment-id cls_s2 --model-dir PATH_TO_LOG -d PATH_TO_MODELNET40 \
-model --flag permutation --kanchor 12 --feat-all-anchors
+# E2PN mode
+python run_modelnet.py experiment --experiment-id cls_s2(free to choose) --model-dir PATH_TO_LOG -d PATH_TO_MODELNET40 \
+model --flag permutation --kanchor 12 --feat-all-anchors --drop_xyz
 
-# modelnet shape alignment
+# EPN mode
+python run_modelnet.py experiment --experiment-id cls_so3 --model-dir PATH_TO_LOG -d PATH_TO_MODELNET40 \
+train_loss --cls-attention-loss
+
+# KPConv mode
+python run_modelnet.py experiment --experiment-id cls_kp --model-dir PATH_TO_LOG -d PATH_TO_MODELNET40 \
+model --flag max --kpconv --kanchor 1
+
+# ESCNN mode
+python run_modelnet_voxel.py experiment --experiment-id cls_v(free to choose) --model-dir PATH_TO_LOG -d PATH_TO_MODELNET40 \
+train --sigma 0.03 model --freq 3 --test_batch_size 24
+```
+
+You can set `--debug-mode check_equiv` to make sure the model satisfies the equivariant condition before starting formal training. 
+
+Running ESCNN models (an equivariant baseline based on steerable CNNs and voxel representation) requires installing corresponding packages, see [ESCNN](https://github.com/QUVA-Lab/escnn). You will also need `point_cloud_utils` package. 
+
+**Evaluation**
+
+Use the same command as training, except adding `--run-mode eval` and `-r PATH_TO_CKPT(full path to pth file)`. For example:
+
+```
+# E2PN mode
+python run_modelnet.py experiment --experiment-id cls_s2 --run-mode eval \
+--model-dir PATH_TO_LOG -d PATH_TO_MODELNET40 -r PATH_TO_CKPT \
+model --flag permutation --kanchor 12 --feat-all-anchors --drop_xyz
+```
+
+You can specify `--shift --jitter --dropout_pt` for random translation, noise, and point dropout as augmentation in training. Set `--train_rot` for different options of training rotational augmentation. Set `--test_aug` to use the training augmentation for testing and `--test_rot` to specify the type of rotations used in testing, or set `--group_test` to test under various conditions all at once. 
+
+### ModelNet40 Shape Alignment
+**Training**
+```
+# E2PN mode
 python run_modelnet_rotation.py experiment --experiment-id rot_s2 --model-dir PATH_TO_LOG -d PATH_TO_MODELNET40 \
 model --flag permutation --kanchor 12
 
-# 3DMatch shape registration
+# EPN mode
+python run_modelnet_rotation.py experiment --experiment-id rot_so3 --model-dir PATH_TO_LOG -d PATH_TO_MODELNET40
+
+# KPConv mode
+python run_modelnet_rotation.py experiment --experiment-id rot_kp --model-dir PATH_TO_LOG -d PATH_TO_MODELNET40 \
+model --kpconv --kanchor 1
+```
+
+You can set `--debug-mode check_equiv` to make sure the model satisfies the equivariant condition before starting formal training. 
+
+**Evaluation**
+
+Similarly, add `--run-mode eval` and `-r PATH_TO_CKPT(full path to pth file)`. For example:
+
+```
+# E2PN mode
+python run_modelnet_rotation.py experiment --experiment-id rot_s2 --run-mode eval \
+--model-dir PATH_TO_LOG -d PATH_TO_MODELNET40 -r PATH_TO_CKPT \
+model --flag permutation --kanchor 12
+```
+To obtain reproducible evaluation result, set `-s SOME_INTEGER` as the random seed. 
+
+### 3DMatch Keypoint Matching
+**Training**
+```
+# E2PN mode
 python run_3dmatch.py experiment --experiment-id inv_s2 --model-dir PATH_TO_LOG -d PATH_TO_3DMATCH_TRAIN \
 train --npt 16 model --kanchor 12
-```
-***EPN mode***
-```
-# modelnet classification
-python run_modelnet.py experiment --experiment-id cls --model-dir PATH_TO_LOG -d PATH_TO_MODELNET40 \
-train_loss --cls-attention-loss
 
-# modelnet shape alignment
-python run_modelnet_rotation.py experiment --experiment-id rot --model-dir PATH_TO_LOG -d PATH_TO_MODELNET40
-
-# 3DMatch shape registration
-python run_3dmatch.py experiment --experiment-id inv --model-dir PATH_TO_LOG -d PATH_TO_3DMATCH_TRAIN \
+# EPN mode
+python run_3dmatch.py experiment --experiment-id inv_so3 --model-dir PATH_TO_LOG -d PATH_TO_3DMATCH_TRAIN \
 train --npt 16
+
+# KPConv mode
+python run_3dmatch.py experiment --experiment-id inv_kp --model-dir PATH_TO_LOG -d PATH_TO_3DMATCH_TRAIN \
+train --npt 16 \
+model --kpconv --kanchor 1
 ```
 
 **Evaluation**
 
-The following lines can be used for the evaluation of each experiment
+Similarly, add `--run-mode eval` and `-r PATH_TO_CKPT(full path to pth file)`. For example:
 
-***E2PN mode***
 ```
-# modelnet classification
-python run_modelnet.py experiment --experiment-id cls_s2 --run-mode eval \
---model-dir PATH_TO_LOG -d PATH_TO_MODELNET40 -r PATH_TO_CKPT \
-model --flag permutation --kanchor 12 --feat-all-anchors
-
-# modelnet shape alignment
-python run_modelnet_rotation.py experiment --experiment-id rot_s2 --run-mode eval \
---model-dir PATH_TO_LOG -d PATH_TO_MODELNET40 -r PATH_TO_CKPT \
-model --flag permutation --kanchor 12
-
-# 3DMatch shape registration
+# E2PN mode
 python run_3dmatch.py experiment --experiment-id inv_s2 --run-mode eval \
 --model-dir PATH_TO_LOG -d PATH_TO_3DMATCH_EVAL -r PATH_TO_CKPT \
 model --kanchor 12
 ```
-***EPN mode***
-```
-# modelnet classification
-python run_modelnet.py experiment --experiment-id cls --run-mode eval \
---model-dir PATH_TO_LOG -d PATH_TO_MODELNET40 -r PATH_TO_CKPT \
-model train_loss --cls-attention-loss
-
-# modelnet shape alignment
-python run_modelnet_rotation.py experiment --experiment-id rot --run-mode eval \
---model-dir PATH_TO_LOG -d PATH_TO_MODELNET40 -r PATH_TO_CKPT
-
-# 3DMatch shape registration
-python run_3dmatch.py experiment --experiment-id inv --run-mode eval \
---model-dir PATH_TO_LOG -d PATH_TO_3DMATCH_EVAL -r PATH_TO_CKPT
-```
-
 
 ## Citation
 If you find our project useful in your research, please consider citing:

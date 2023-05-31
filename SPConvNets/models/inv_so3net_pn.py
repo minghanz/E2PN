@@ -60,9 +60,12 @@ def build_model(opt,
     so3_pooling =  opt.model.flag
     input_radius = opt.model.search_radius
     kpconv = opt.model.kpconv
+    sym_kernel = not opt.model.no_sym_kernel
 
     p_pool_first = opt.model.p_pool_first
     permute_nl = opt.model.permute_nl
+    p_pool_to_cout = opt.model.p_pool_to_cout
+    permute_soft = opt.model.permute_soft
 
     na = 1 if opt.model.kpconv else opt.model.kanchor
 
@@ -143,6 +146,8 @@ def build_model(opt,
                 block_type = 'separable_block' 
             elif na == 12:
                 block_type = 'separable_s2_block'
+            elif na < 60:
+                block_type = 'inter_block'
             else:
                 raise ValueError(f"na={na} not supported.")
 
@@ -162,8 +167,11 @@ def build_model(opt,
                     'activation': 'leaky_relu',
                     'pooling': xyz_pooling,
                     'kanchor': na,
+                    # 'sym_kernel': sym_kernel,
                 }
             }
+            if na == 12:
+                conv_param['args']['sym_kernel'] = sym_kernel
             block_param.append(conv_param)
 
             dim_in = dim_out
@@ -177,7 +185,9 @@ def build_model(opt,
         'temperature': temperature,
         'kanchor': na,
         'p_pool_first': p_pool_first,
+        'p_pool_to_cout': p_pool_to_cout,
         'permute_nl': permute_nl,
+        'permute_soft': permute_soft,
     }
 
 

@@ -369,14 +369,14 @@ def get_relativeV12_index():
     return trace_idx_ori.copy(), trace_idx_rot.copy()
 
 def get_relativeVR_index(full=False):
-    """return two 60(rotation anchors)*60(indices on anchor rotations) index matrices,
-    or two 60(rotation anchors)*12(indices on the anchor rotations that are sections of icoshedron vertices) index matrices. 
-    The latter case is different from get_relativeV_index(), because here the indices are in the range of 60. 
+    """if full==true, return two 60(rotation anchors)*60(indices on anchor rotations) index matrices,
+    otherwise, return two 60(rotation anchors)*12(indices on the anchor rotations that are sections of icoshedron vertices) index matrices. 
+    The latter case is different from get_relativeV_index(), because here the second indices are in the range of 60. 
     """
     trace_idx_ori, trace_idx_rot = fr.get_relativeR_index(vRs)  
     # da     # find correspinding original element for each rotated (60,60)
     # bd     # find corresponding rotated element for each original
-    trace_idx_rot = trace_idx_rot.transpose(0,1)    # db
+    trace_idx_rot = trace_idx_rot.swapaxes(0,1)    # db    # changed 11/10/2022, before it is transpose(0,1), which has no effect
     if full:
         return trace_idx_ori.copy(), trace_idx_rot.copy()
 

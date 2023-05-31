@@ -16,9 +16,30 @@ from . import functional as L
 
 KERNEL_CONDENSE_RATIO = 0.7
 
+def sort_level_vs(v_idxs, vs):
+    idx_l1_0 = v_idxs[0]
+    idx_l1_sorted = []
+    idx_l1_sorted.append(idx_l1_0)
+    vs_l1 = vs[v_idxs][:, :2]  # only take the xy plane
+    vs_l1_0 = vs_l1[[0]]    # 1*2
+    dtheta = 2 * np.pi / 5
+    ct = np.cos(dtheta)
+    st = np.sin(dtheta)
+    rotmat = np.array([[ct, -st], [st, ct]], dtype=np.float32)
+    for _ in range(4):
+        vs_l1_0 = rotmat.dot(vs_l1_0.T).T   # 1*2
+        diff = vs_l1 - vs_l1_0  # 5*2
+        diff_l1 = np.abs(diff).sum(1)
+        iidx_cur = np.argmin(diff_l1)
+        idx_cur = v_idxs[iidx_cur]
+        idx_l1_sorted.append(idx_cur)
+    idx_l1_sorted = np.array(idx_l1_sorted)
+    return idx_l1_sorted
+
 class BasicS2Conv(nn.Module):
     def __init__(self, dim_in, dim_out, kernel_size, anchor_size, debug=False):
         """Linear layer projecting features aggregated at the kernel points to the centers.
+        The weight matrix in this implementation does not satisfy the equivariant constraint. 
         [b, c1, k, p, a] -> [b, c2, p, a]"""
         super(BasicS2Conv, self).__init__()
         self.dim_in = dim_in
@@ -48,7 +69,7 @@ class BasicS2Conv(nn.Module):
         self.register_buffer('trace_idx_rot', torch.tensor(trace_idx_rot.astype(np.int64)))
 
         ### pick the self, neighbor, level2, opposite, center indices
-        _, v_adjs, v_level2s, v_opps, _ = L.get_icosahedron_vertices() # 12*5, 12*5, 12
+        vs, v_adjs, v_level2s, v_opps, _ = L.get_icosahedron_vertices() # 12*5, 12*5, 12
         v0_adjs = v_adjs[0]         # 5
         v0_level2s = v_level2s[0]   # 5
         v0_opps = v_opps[0]         # a number
@@ -75,6 +96,123 @@ class BasicS2Conv(nn.Module):
 
         W = self.W[..., None].expand(-1,-1,-1,-1, self.anchor_size)  # c2,c1,5,a(channels),a(rotations)
         W = torch.gather(W, 2, self.idxs_k)  # c2,c1,5,a(channels),a(rotations) -> c2,c1,k,a(channels),a(rotations)
+        W = torch.gather(W, 3, self.idxs_a)  # c2,c1,k,a(channels),a(rotations) -> c2,c1,k,a(channels permuted),a(rotations)
+        x = torch.einsum("dckar, bckpa->bdpr", W, x)
+        return x
+
+class BasicS2ConvV2(nn.Module):
+    def __init__(self, dim_in, dim_out, kernel_size, anchor_size, debug=False) -> None:
+        """Linear layer projecting features aggregated at the kernel points to the centers.
+        Using the exact derivation
+        [b, c1, k, p, a] -> [b, c2, p, a]"""
+        super().__init__()
+        self.dim_in = dim_in
+        self.dim_out = dim_out
+        self.kernel_size = kernel_size
+        self.anchor_size = anchor_size
+
+        assert self.kernel_size == 13, f"kernel_size {kernel_size} not implemented"
+        W = torch.empty(self.dim_out, self.dim_in, 36, dtype=torch.float32)      # c2, c1, 36(3*4+2*12)
+        nn.init.xavier_normal_(W, gain=nn.init.calculate_gain('relu'))
+        # W = W.view(self.dim_out, self.dim_in*5)
+        self.register_parameter('W', nn.Parameter(W))
+
+        ### permute the weights under rotations
+        trace_idx_ori, trace_idx_rot = L.get_relativeV12_index()    # 12(rotation anchors)*12(indices on s2), 12*12
+        # trace_idxv_ori = trace_idxv_ori.transpose(1,0)  # 12(indices on s2)*12(rotation anchors)
+        # trace_idxv_rot = trace_idxv_rot.transpose(1,0)  # 12*12
+
+        # vertices = np.concatenate([kernels, np.zeros_like(kernels[[0]])], axis=0) # 13,3
+        trace_idxv_ori = np.concatenate([trace_idx_ori,np.ones_like(trace_idx_ori[:, [0]])*12],axis=1)   # 12(na)*13(nk)
+        trace_idxv_rot = np.concatenate([trace_idx_rot,np.ones_like(trace_idx_rot[:, [0]])*12],axis=1)   # 12*13
+
+        self.register_buffer('trace_idxv_ori', torch.tensor(trace_idxv_ori.astype(np.int64)))   # 12(na)*13(nk)
+        self.register_buffer('trace_idxv_rot', torch.tensor(trace_idxv_rot.astype(np.int64)))
+
+        self.register_buffer('trace_idx_ori', torch.tensor(trace_idx_ori.astype(np.int64))) # 12(na rotations)*12(na channels)
+        self.register_buffer('trace_idx_rot', torch.tensor(trace_idx_rot.astype(np.int64)))
+
+        ### pick the self, neighbor, level2, opposite, center indices
+        vs, v_adjs, v_level2s, v_opps, _ = L.get_icosahedron_vertices() # 12*5, 12*5, 12
+        v0_adjs = v_adjs[0]         # 5
+        v0_level2s = v_level2s[0]   # 5
+        v0_opps = v_opps[0]         # a number
+        inv_idxs = torch.empty(anchor_size, dtype=torch.int64)
+        inv_idxs[0] = 0
+        inv_idxs[v0_adjs] = 1
+        inv_idxs[v0_level2s] = 2
+        inv_idxs[v0_opps] = 3
+
+        v0_adjs_sorted = sort_level_vs(v0_adjs, vs)
+        v0_level2s_sorted = sort_level_vs(v0_level2s, vs)
+        v0_adjs_sorted = torch.tensor(v0_adjs_sorted, dtype=torch.int64)
+        v0_level2s_sorted = torch.tensor(v0_level2s_sorted, dtype=torch.int64)
+
+        idx_map = torch.empty(kernel_size * anchor_size, dtype=torch.int64) # each element is an index in the range 36
+        ### the three kernel points on the z axis
+        idx_map[:anchor_size] = inv_idxs
+        idx_map[v0_opps*anchor_size:(v0_opps+1)*anchor_size ] = inv_idxs + 4
+        idx_map[-anchor_size:] = inv_idxs + 8
+        ### the rest kernel points on the 2 rings
+        idx_seq = torch.arange(12,24, dtype=torch.int64)
+        idx_seq2 = torch.arange(24,36, dtype=torch.int64)
+        idx_map[v0_adjs_sorted[0]*anchor_size:(v0_adjs_sorted[0]+1)*anchor_size] = idx_seq
+        idx_map[v0_level2s_sorted[0]*anchor_size:(v0_level2s_sorted[0]+1)*anchor_size] = idx_seq2
+
+        idx_seq_new = torch.empty(anchor_size, dtype=torch.int64)
+        v0_adjs_sorted_shifted = v0_adjs_sorted[[4,0,1,2,3]]
+        idx_seq_new[v0_adjs_sorted] = v0_adjs_sorted_shifted
+        v0_level2s_sorted_shifted = v0_level2s_sorted[[4,0,1,2,3]]
+        idx_seq_new[v0_level2s_sorted] = v0_level2s_sorted_shifted
+        idx_seq_new[0] = 0
+        idx_seq_new[v0_opps] = v0_opps
+        idx_map[v0_adjs_sorted[1]*anchor_size:(v0_adjs_sorted[1]+1)*anchor_size] = idx_seq[idx_seq_new]
+        idx_map[v0_level2s_sorted[1]*anchor_size:(v0_level2s_sorted[1]+1)*anchor_size] = idx_seq2[idx_seq_new]
+
+        idx_seq_new = torch.empty(anchor_size, dtype=torch.int64)
+        v0_adjs_sorted_shifted = v0_adjs_sorted[[3,4,0,1,2]]
+        idx_seq_new[v0_adjs_sorted] = v0_adjs_sorted_shifted
+        v0_level2s_sorted_shifted = v0_level2s_sorted[[3,4,0,1,2]]
+        idx_seq_new[v0_level2s_sorted] = v0_level2s_sorted_shifted
+        idx_seq_new[0] = 0
+        idx_seq_new[v0_opps] = v0_opps
+        idx_map[v0_adjs_sorted[2]*anchor_size:(v0_adjs_sorted[2]+1)*anchor_size] = idx_seq[idx_seq_new]
+        idx_map[v0_level2s_sorted[2]*anchor_size:(v0_level2s_sorted[2]+1)*anchor_size] = idx_seq2[idx_seq_new]
+
+        idx_seq_new = torch.empty(anchor_size, dtype=torch.int64)
+        v0_adjs_sorted_shifted = v0_adjs_sorted[[2,3,4,0,1]]
+        idx_seq_new[v0_adjs_sorted] = v0_adjs_sorted_shifted
+        v0_level2s_sorted_shifted = v0_level2s_sorted[[2,3,4,0,1]]
+        idx_seq_new[v0_level2s_sorted] = v0_level2s_sorted_shifted
+        idx_seq_new[0] = 0
+        idx_seq_new[v0_opps] = v0_opps
+        idx_map[v0_adjs_sorted[3]*anchor_size:(v0_adjs_sorted[3]+1)*anchor_size] = idx_seq[idx_seq_new]
+        idx_map[v0_level2s_sorted[3]*anchor_size:(v0_level2s_sorted[3]+1)*anchor_size] = idx_seq2[idx_seq_new]
+
+        idx_seq_new = torch.empty(anchor_size, dtype=torch.int64)
+        v0_adjs_sorted_shifted = v0_adjs_sorted[[1,2,3,4,0]]
+        idx_seq_new[v0_adjs_sorted] = v0_adjs_sorted_shifted
+        v0_level2s_sorted_shifted = v0_level2s_sorted[[1,2,3,4,0]]
+        idx_seq_new[v0_level2s_sorted] = v0_level2s_sorted_shifted
+        idx_seq_new[0] = 0
+        idx_seq_new[v0_opps] = v0_opps
+        idx_map[v0_adjs_sorted[4]*anchor_size:(v0_adjs_sorted[4]+1)*anchor_size] = idx_seq[idx_seq_new]
+        idx_map[v0_level2s_sorted[4]*anchor_size:(v0_level2s_sorted[4]+1)*anchor_size] = idx_seq2[idx_seq_new]
+        self.register_buffer('idx_map', idx_map)
+
+        idxs_k = self.trace_idxv_rot.transpose(0,1)[:,None,:].expand(-1, anchor_size, -1)  # a(rotations),k -> k, a(channels), a(rotations)
+        
+        idxs_a = self.trace_idx_rot.transpose(0,1)[None].expand(kernel_size, -1, -1) # a(rotations),a(channels) -> k, a(channels), a(rotations)
+
+        idxs_k = idxs_k[None,None].expand(self.dim_out, self.dim_in, -1,-1,-1)  # c2, c1, k, a(channels), a(rotations)
+        idxs_a = idxs_a[None,None].expand(self.dim_out, self.dim_in, -1,-1,-1)  # c2, c1, k, a(channels), a(rotations)
+        self.register_buffer('idxs_k', idxs_k)  #   c2, c1, k, a(channels), a(rotations)
+        self.register_buffer('idxs_a', idxs_a)  #   c2, c1, k, a(channels), a(rotations)
+
+    def forward(self, x):
+        W = self.W[:,:,self.idx_map].reshape(self.dim_out, self.dim_in, self.kernel_size, self.anchor_size)    #C2,C1,kernel_size * anchor_size
+        W = W[..., None].expand(-1,-1,-1,-1, self.anchor_size)
+        W = torch.gather(W, 2, self.idxs_k)  # c2,c1,k,a(channels),a(rotations) -> c2,c1,k,a(channels),a(rotations)
         W = torch.gather(W, 3, self.idxs_a)  # c2,c1,k,a(channels),a(rotations) -> c2,c1,k,a(channels permuted),a(rotations)
         x = torch.einsum("dckar, bckpa->bdpr", W, x)
         return x
@@ -191,7 +329,8 @@ class S2Conv(nn.Module):
                 n_neighbor,
                 lazy_sample=True, 
                 pooling=None, 
-                kanchor=12) -> None:
+                kanchor=12,
+                sym_kernel=True) -> None:
         """Point grouping, subsampling, and convolution
         [b, c1, k, p, a] -> [b, c2, p, a] """
         super().__init__()
@@ -218,8 +357,10 @@ class S2Conv(nn.Module):
         self.n_neighbor = n_neighbor
         self.lazy_sample = lazy_sample
         self.pooling = pooling
+        self.sym_kernel = sym_kernel
         
-        self.basic_conv = BasicS2Conv(dim_in, dim_out, self.kernel_size, anchors.shape[0])
+        # self.basic_conv = BasicS2Conv(dim_in, dim_out, self.kernel_size, anchors.shape[0])
+        self.basic_conv = BasicS2ConvV2(dim_in, dim_out, self.kernel_size, anchors.shape[0])
 
         self.register_buffer('anchors', torch.tensor(anchors).to(torch.float32))
         self.register_buffer('kernels', torch.tensor(kernels).to(torch.float32))
@@ -230,7 +371,7 @@ class S2Conv(nn.Module):
                                   self.anchors, self.kernels,
                                   self.radius, self.sigma,
                                   inter_idx, inter_w, self.lazy_sample, pooling=self.pooling,
-                                  norot=True)
+                                  norot=self.sym_kernel)
 
 
         # torch.set_printoptions(sci_mode=False)
@@ -330,24 +471,37 @@ class IntraSO3Conv(nn.Module):
 
 
 class PointnetSO3Conv(nn.Module):
-    def __init__(self, dim_in, dim_out, kanchor=60):
+    def __init__(self, dim_in, dim_out, kanchor=60, drop_xyz=False):
         '''
         equivariant pointnet architecture for a better aggregation of spatial point features
-        f (nb, nc, np, na) x xyz (nb, 3, np, na) -> maxpool(h(nb,nc+3,p0,na),h(nb,nc+3,p1,na),h(nb,nc+3,p2,na),...)
+        f (nb, nc, np, na) x xyz (nb, 3, np, na) -> (nb, ncout, na)
         '''
         super(PointnetSO3Conv, self).__init__()
 
-        if kanchor == 12:
+        ### changing this part could make old models fail because of missing keys 'anchors'
+        if kanchor == 1:
+            self.anchors = None
+        elif kanchor == 12:
+        # if kanchor == 12:
             # get so3 anchors (12x3x3 rotation matrices)
             anchors = L.get_anchorsV12()   # 12*3*3
+            self.register_buffer('anchors', torch.from_numpy(anchors))
         else:
+            assert kanchor == 60, kanchor
             # get so3 anchors (60x3x3 rotation matrices)
             anchors = L.get_anchors(kanchor)
-        self.dim_in = dim_in + 3
+            self.register_buffer('anchors', torch.from_numpy(anchors))
+        
+        ### for quotient anchors, drop_xyz preserves equivariance
+        self.drop_xyz = drop_xyz
+        if drop_xyz:
+            self.dim_in = dim_in
+        else:
+            self.dim_in = dim_in + 3
+            
         self.dim_out = dim_out
 
         self.embed = nn.Conv2d(self.dim_in, self.dim_out,1)
-        self.register_buffer('anchors', torch.from_numpy(anchors))
 
     def forward(self, x):
         xyz = x.xyz
@@ -360,9 +514,13 @@ class PointnetSO3Conv(nn.Module):
         if na == 1:
             feats = torch.cat([x.feats, xyz[...,None]],1)
         else:
-            xyzr = torch.einsum('aji,bjn->bina',self.anchors,xyz)
-            feats = torch.cat([x.feats, xyzr],1)
+            if self.drop_xyz:
+                feats = x.feats
+            else:
+                xyzr = torch.einsum('aji,bjn->bina',self.anchors,xyz)
+                feats = torch.cat([x.feats, xyzr],1)
 
         feats = self.embed(feats)
+        # bcpa -> bca
         feats = torch.max(feats,2)[0]
         return feats # nb, nc, na

@@ -44,9 +44,9 @@ class RegSO3ConvModel(nn.Module):
         ### pc_src.T = R * pc_tgt.T
 
         # confidence, quats = self.outblock(x.feats)
-        confidence, quats = self.outblock(f1, f2, x1, x2)
+        return self.outblock(f1, f2, x1, x2)
 
-        return confidence, quats
+        # return confidence, quats
 
     def get_anchor(self):
         return self.backbone[-1].get_anchor()
@@ -75,6 +75,9 @@ def build_model(opt,
     representation = opt.model.representation
     na = 1 if opt.model.kpconv else opt.model.kanchor
     so3_pooling =  opt.model.flag
+    rot_ref_tgt = opt.rot_ref_tgt
+    topk = opt.topk
+    sym_kernel = not opt.model.no_sym_kernel
 
     if input_num > 1024:
         sampling_ratio /= (input_num / 1024)
@@ -143,6 +146,8 @@ def build_model(opt,
                 block_type = 'separable_block' 
             elif na == 12:
                 block_type = 'separable_s2_block'
+            elif na < 60:
+                block_type = 'inter_block'
             else:
                 raise ValueError(f"na={na} not supported.")
             # block_type = 'inter_block' if na != 60 else 'separable_block'
@@ -162,8 +167,11 @@ def build_model(opt,
                     'activation': 'leaky_relu',
                     'pooling': xyz_pooling,
                     'kanchor': na,
+                    # 'sym_kernel': sym_kernel,
                 }
             }
+            if na == 12:
+                conv_param['args']['sym_kernel'] = sym_kernel
             block_param.append(conv_param)
             dim_in = dim_out
 
@@ -178,6 +186,9 @@ def build_model(opt,
                 'representation': representation,
                 'temperature': temperature,
                 'pooling': so3_pooling,
+                'rot_ref_tgt': rot_ref_tgt,
+                'topk': topk,
+                'check_equiv': opt.debug_mode == 'check_equiv',
         }
 
     if to_file is not None:
