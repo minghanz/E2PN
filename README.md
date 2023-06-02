@@ -1,9 +1,10 @@
 
 # E2PN: Efficient SE(3)-Equivariant Point Network
+<center>
+<iframe width="560" height="315" src="https://www.youtube.com/embed/B4XDxd0h08I" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
+</center>
 
 This repository contains the official code (in PyTorch) for the CVPR 2023 paper [E2PN: Efficient SE(3)-Equivariant Point Network](https://openaccess.thecvf.com/content/CVPR2023/html/Zhu_E2PN_Efficient_SE3-Equivariant_Point_Network_CVPR_2023_paper.html). 
-
-The implementation is based on an open-sourced existing work [EPN](https://github.com/nintendops/EPN_PointCloud). 
 
 
 ## Contents
@@ -15,14 +16,16 @@ The implementation is based on an open-sourced existing work [EPN](https://githu
 
 ## Introduction
 
-E2PN is a SE(3)-equivariant network architecture designed for deep point cloud analysis. It mainly includes a SE(3)-equivariant convolution on $S^2\times \mathbb{R}^3$ which is a homogeneous space of SE(3), and a permutation layer to recover SE(3) information from the features in the homogeneous space. 
+E2PN is a SE(3)-equivariant network architecture designed for deep point cloud analysis. It largely improves the efficiency in terms of memory consumption and running speed for equivariant point cloud feature learning. 
+
+It mainly includes a SE(3)-equivariant convolution on $S^2\times \mathbb{R}^3$ which is a homogeneous space of SE(3), and a permutation layer to recover SE(3) information from the features in the homogeneous space. 
 
 <!-- ![](https://github.com/nintendops/EPN_PointCloud/blob/main/media/spconv.png) -->
 
 
 
 ## Usage
-We use the same dependencies as the [EPN](https://github.com/nintendops/EPN_PointCloud) repository. 
+Our code is developed based on an open-sourced existing work [EPN](https://github.com/nintendops/EPN_PointCloud). We use the same dependencies as the [EPN](https://github.com/nintendops/EPN_PointCloud) repository. 
 
 The code has been tested on Python 3.7.12, PyTorch 1.11.0 and CUDA 11.3.1. The module and additional dependencies can be set up with 
 ```
