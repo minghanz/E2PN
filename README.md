@@ -1,5 +1,5 @@
 
-# E2PN: Efficient SE(3)-Equivariant Point Network
+# E2PN: Efficient SE(3)-Equivariant Point Network (CVPR 2023)
 
 [![Watch the video](https://img.youtube.com/vi/B4XDxd0h08I/hqdefault.jpg)](https://youtu.be/B4XDxd0h08I)
 
