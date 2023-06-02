@@ -1,8 +1,8 @@
 
 # E2PN: Efficient SE(3)-Equivariant Point Network
-<center>
-<iframe width="560" height="315" src="https://www.youtube.com/embed/B4XDxd0h08I" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
-</center>
+
+[![Watch the video](https://img.youtube.com/vi/B4XDxd0h08I/hqdefault.jpg)](https://youtu.be/B4XDxd0h08I)
+
 
 This repository contains the official code (in PyTorch) for the CVPR 2023 paper [E2PN: Efficient SE(3)-Equivariant Point Network](https://openaccess.thecvf.com/content/CVPR2023/html/Zhu_E2PN_Efficient_SE3-Equivariant_Point_Network_CVPR_2023_paper.html). 
 
